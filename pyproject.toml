@@ -1,0 +1,10 @@
+[project]
+name = "voice-agent"
+version = "0.1.0"
+description = "AI voice agent on Asterisk (AudioSocket)"
+requires-python = ">=3.10"
+dependencies = []          # runtime uses the standard library only
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

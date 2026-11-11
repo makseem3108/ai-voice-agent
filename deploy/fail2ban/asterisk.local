@@ -1,0 +1,15 @@
+# voice-agent: ban SIP scanners / password guessers (reads Asterisk security log)
+[asterisk]
+enabled  = true
+filter   = asterisk
+logpath  = /var/log/asterisk/security
+maxretry = 5
+findtime = 600
+bantime  = 86400
+# ban only the SIP/RTP ports, so a mistyped softphone password can never lock SSH
+port     = 5060,10000:10100
+protocol = udp
+banaction = iptables-multiport
+action   = %(action_)s
+# optional: your own static IP, so a typo never bans you
+ignoreip = 127.0.0.1/8 __TRUSTED_IP__

@@ -1,0 +1,19 @@
+# /etc/systemd/system/voice-agent.service
+[Unit]
+Description=AI Voice Agent - AudioSocket server (127.0.0.1:9092)
+After=network.target
+
+[Service]
+Type=simple
+User=voice
+Group=voiceagent
+WorkingDirectory=/home/voice/voice-agent
+ExecStart=/home/voice/voice-agent/.venv/bin/python -m app.server
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=2
+MemoryMax=256M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
