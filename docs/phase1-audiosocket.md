@@ -4,6 +4,10 @@ Extension `700` hands the call's audio to a Python asyncio server over a local
 TCP connection. For now the server is a **delayed echo**: you hear yourself
 about one second late (extension `600` is Asterisk's own instant echo).
 
+> **Since phase 2a** the delayed echo is off by default and extension `700` feeds
+> live speech-to-text instead (see [phase2a-stt.md](phase2a-stt.md)). Set `ECHO_MODE=true`
+> in `.env` to get the echo described here back for debugging.
+
 ```
 softphone --SIP/RTP--> Asterisk --TCP 127.0.0.1:9092 (AudioSocket)--> app/server.py
 ```

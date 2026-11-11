@@ -19,3 +19,6 @@ recordings/
 .idea/
 .vscode/
 .DS_Store
+
+# call transcripts / recordings (personal data)
+data/
