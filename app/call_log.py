@@ -36,6 +36,8 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
     if kind == "speech_start":
         return f"[speech_start] at {record['audio_t']:.2f}s"
     if kind == "user":
+        if record.get("ignored") == "closing":
+            return f"[user] {record['text']} (said during the closing line; not a new request, so the call ends as planned)"
         return f"[user] {record['text']}"
     if kind == "bot":
         note = " (interrupted)" if record.get("interrupted") else ""
@@ -49,7 +51,7 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
         return (
             f"[turn {record['turn']}] stt_ms={ms('stt_ms')} llm_first_token_ms={ms('llm_first_token_ms')} "
             f"tts_first_audio_ms={ms('tts_first_audio_ms')} total_ms={ms('total_ms')} "
-            f"eager={'yes' if record.get('eager') else 'no'}"
+            f"eager={'yes' if record.get('eager') else 'no'} llm_path={record.get('llm_path') or 'n/a'}"
         )
     if kind == "barge_in":
         dropped = record.get("dropped_frames", 0)
@@ -72,7 +74,7 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
             f"hanging up in {record.get('hangup_in_ms', 0):.0f} ms" + (" (at the limit)" if record.get("capped") else "")
         )
     if kind == "hangup_cancelled":
-        return "[hangup_cancelled] caller spoke after the closing line; call continues"
+        return "[hangup_cancelled] caller asked something during the closing line; call continues"
     if kind == "ending_blocked":
         why = {
             "caller_did_not_decline": "the caller's last words were not a decline or goodbye",
@@ -85,7 +87,26 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
             f"[state] outcome={record.get('outcome') or 'undecided'} phase={record.get('phase')} "
             f"next={record.get('next_slot') or '-'} slots: {known}"
             + (" (replanned)" if record.get("replanned") else "")
+            + (f" (will re-check {record['recheck']})" if record.get("recheck") else "")
         )
+    if kind == "rtp_stats":
+        def ms(key: str) -> str:
+            value = record.get(key)
+            return "?" if value is None else f"{value:g} ms"
+
+        def part(direction: str, label: str) -> str:
+            return (
+                f"{label}: packets={record.get(direction + '_packets', '?')} lost={record.get(direction + '_lost', '?')}"
+                f" ({record.get(direction + '_loss_pct', '?')}%)"
+                f" jitter avg={ms(direction + '_jitter_avg_ms')} worst={ms(direction + '_jitter_max_ms')}"
+            )
+
+        return (
+            f"[rtp] {part('rx', 'phone->server')} | {part('tx', 'server->phone (reported by phone)')}"
+            f" | round trip avg={ms('rtt_avg_ms')} worst={ms('rtt_max_ms')}"
+        )
+    if kind == "llm_json_fallback":
+        return "[llm_json_fallback] the model answered in plain text instead of JSON; the text was clean, so it was spoken (slots unchanged)"
     if kind == "eager_skipped":
         return "[eager_skipped] token budget is low; early start disabled until it recovers"
     if kind == "error":

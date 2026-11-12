@@ -62,10 +62,13 @@ The lead profile collects `interest`, `owns_home`, `monthly_bill`, `name` and
 "monthly_bill": {"text": "over five hundred shekels per month", "amount": 500, "currency": "ILS"}
 ```
 
-The model fills three reply fields for it (`monthly_bill`,
-`monthly_bill_amount`, `monthly_bill_currency`); the code combines and checks
-them. If no number can be understood, `amount` and `currency` are null and the
-text alone fills the slot.
+The model returns one text field (what the caller said); the number and the
+currency are read from it by code (`app/amounts.py`: digits and number words
+in English, Hebrew and Arabic). If no single number can be understood -
+nothing was said, or two different numbers ("between 400 and 500") - `amount`
+and `currency` are null and the text alone fills the slot. An earlier version
+asked the model for three fields; that made it stop answering in JSON on
+caller questions, so the format is kept as simple as possible.
 
 ### Outcome variants
 
@@ -135,12 +138,34 @@ webhook will consume later).
 ### Structured output and latency
 
 Groq's strict structured output (`json_schema`, `strict: true`) constrains the
-model to the reply schema, so the JSON is valid by construction. On Groq a
-structured reply is delivered in one piece, not token by token, so the first
-sentence can no longer start while the second is still being written. With
-replies of one or two sentences the whole reply arrives in roughly 0.4-0.6 s.
-If a structured request fails, the client retries in plain JSON mode and
-checks the result itself, up to twice.
+model to the reply schema. On Groq a structured reply is delivered in one
+piece, not token by token, so the first sentence can no longer start while the
+second is still being written. With replies of one or two sentences the whole
+reply arrives in roughly 0.4-0.6 s.
+
+In practice JSON mode fails now and then with this model: it writes a good
+answer as plain sentences and Groq rejects it (HTTP 400 "Failed to generate
+JSON"), mostly on caller questions. Groq documents no cure, so a reply can be
+obtained in three ways, tried in order; the `[turn]` line shows which one
+answered (`llm_path=`):
+
+| Path             | What it is                                                        | Slots |
+|------------------|-------------------------------------------------------------------|-------|
+| `json`           | strict JSON mode, the first attempt                               | yes   |
+| `function_call`  | the same schema as a function the model must call (second request) | yes   |
+| `text_fallback`  | the model's plain sentences, only if clean: under 300 characters, no JSON or markup fragments, in the profile's language | no |
+
+If none works the caller hears the apology. After a `text_fallback` turn that
+was asking for a slot which decides the outcome (own or rent, for example),
+the next turn settles that slot first - filled from what was already said, or
+asked again - before moving on.
+
+`scripts/replay_llm.py --runs 4` sends realistic turns (including caller
+questions in mid-conversation) to the real model and prints how many were
+answered through each path. Run it before deploying any change to the prompt,
+the per-turn instruction or the reply format: the unit tests use a fake model
+and cannot see this kind of failure. Last run (2026-11-12, 44 turns): 38 json,
+6 function_call, 0 fallback, 0 apology.
 
 ### Head start (eager end of turn)
 
@@ -296,10 +321,14 @@ Its instructions say so, and it is not even given the closing texts.
    model does not answer within 2.5 s the call closes on what is already
    known. After the outcome has been announced, a decline or goodbye closes
    immediately with no request.
-5. **The hang-up can be cancelled.** After the closing line the server waits
-   `END_SILENCE_MS` (default 1.5 s). If speech recognition reports the caller
-   speaking during the closing line or in that window, the hang-up is
-   cancelled (`[hangup_cancelled]`).
+5. **The closing line is finished once it has started.** Sound from the
+   caller does not pause, cut or restart it. If the caller says something
+   during the line or in the `END_SILENCE_MS` window after it (default 1.5 s),
+   the hang-up waits for the transcript, which decides: "bye", "thanks", "ok"
+   or talk not meant for the bot is ignored and the call ends as planned; only
+   a real new request - a question, "wait", "one more thing" - stops the
+   closing and is answered (`[hangup_cancelled]`). The rule is plain pattern
+   matching (`interrupts_closing` in `app/intent.py`).
 6. **Noise cannot hold the line open.** Sound picked up by the local voice
    detector in that window pushes the hang-up out by another
    `END_SILENCE_MS`, but never beyond `END_SILENCE_MAX_MS` (default 3 s) after

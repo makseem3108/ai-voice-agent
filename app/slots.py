@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
+from .amounts import parse_amount
+
 SLOT_TYPES = ("yes_no", "choice", "text", "number", "money")
 OUTCOME_QUALIFIED = "qualified"
 OUTCOME_NOT_FIT = "not_fit"
@@ -37,9 +39,6 @@ _UNKNOWN = {"", "unknown", "n/a", "na", "none", "null", "not sure", "unsure", "n
 _NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
 
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
-#: Extra reply fields the model fills for a "money" slot, next to the raw text.
-MONEY_AMOUNT_SUFFIX = "_amount"
-MONEY_CURRENCY_SUFFIX = "_currency"
 RESERVED_OUTCOMES = (OUTCOME_QUALIFIED, OUTCOME_NOT_FIT, OUTCOME_INCOMPLETE)
 
 #: Text, a number, or for "money" slots ``{"text": ..., "amount": ..., "currency": ...}``.
@@ -172,11 +171,6 @@ def parse_slots(data: Any) -> tuple[tuple[SlotDef, ...], list[str]]:
                 currency=currency,
             )
         )
-    for slot in slots:
-        if slot.type == "money":
-            for extra in (slot.name + MONEY_AMOUNT_SUFFIX, slot.name + MONEY_CURRENCY_SUFFIX):
-                if extra in seen:
-                    problems.append(f"slot '{extra}' clashes with a field of the money slot '{slot.name}'; rename it")
     if slots and not any(s.required for s in slots):
         problems.append("at least one slot must be required, otherwise every caller qualifies immediately")
     return tuple(slots), problems
@@ -186,9 +180,9 @@ def parse_slots(data: Any) -> tuple[tuple[SlotDef, ...], list[str]]:
 def normalise_value(slot: SlotDef, raw: Any) -> Optional[SlotValue]:
     """A valid value for ``slot``, or None if ``raw`` is unknown or not acceptable."""
     if slot.type == "money":
-        if isinstance(raw, dict):
-            return money_value(slot, raw.get("text"), raw.get("amount"), raw.get("currency"))
-        return money_value(slot, raw, None, None)
+        if isinstance(raw, dict):  # an already stored value
+            raw = raw.get("text")
+        return money_value(slot, raw)
     if raw is None or isinstance(raw, (list, dict)):
         return None
     if slot.type == "number":
@@ -216,40 +210,24 @@ def normalise_value(slot: SlotDef, raw: Any) -> Optional[SlotValue]:
     return text[:MAX_TEXT_CHARS]
 
 
-def _amount(raw: Any) -> Optional[Union[int, float]]:
-    if raw is None or isinstance(raw, (bool, list, dict)):
-        return None
-    if not isinstance(raw, (int, float)):
-        match = _NUMBER_RE.search(str(raw).replace(",", ""))
-        if match is None:
-            return None
-        raw = float(match.group(0))
-    if raw != raw or raw <= 0 or raw > 1e9:  # NaN, zero/negative or absurd
-        return None
-    return int(raw) if float(raw).is_integer() else round(float(raw), 2)
-
-
-def money_value(slot: SlotDef, text: Any, amount: Any, currency: Any) -> Optional[dict[str, Any]]:
+def money_value(slot: SlotDef, text: Any) -> Optional[dict[str, Any]]:
     """``{"text", "amount", "currency"}`` for a money slot, or None if nothing usable was said.
 
-    ``text`` is what the caller said and is always kept. ``amount`` and
-    ``currency`` are filled when the model could turn it into a number; the
-    slot's own currency is assumed if the caller named none.
+    The model gives one piece of text: what the caller said. The words are
+    always kept; the number and the currency are read from them by
+    :func:`app.amounts.parse_amount` (English, Hebrew, Arabic). If the caller
+    named no currency the slot's own is assumed; if no single number can be
+    understood, ``amount`` and ``currency`` stay None.
     """
-    clean_text = None
-    if text is not None and not isinstance(text, (bool, list, dict)):
-        clean_text = " ".join(str(text).split())[:MAX_TEXT_CHARS]
-        if clean_text.lower() in _UNKNOWN:
-            clean_text = None
-    number = _amount(amount)
-    if clean_text is None and number is None:
+    if text is None or isinstance(text, (bool, list, dict)):
         return None
-    code = None
-    if number is not None:
-        code = str(currency).strip().upper() if isinstance(currency, str) else ""
-        if not _CURRENCY_RE.match(code):
-            code = slot.currency or None
-    return {"text": clean_text if clean_text is not None else f"{number} {code or ''}".strip(), "amount": number, "currency": code}
+    clean = " ".join(str(text).split())[:MAX_TEXT_CHARS]
+    if clean.lower() in _UNKNOWN:
+        return None
+    amount, currency = parse_amount(clean)
+    if amount is None:
+        return {"text": clean, "amount": None, "currency": None}
+    return {"text": clean, "amount": amount, "currency": currency or slot.currency or None}
 
 
 def display_value(value: Any) -> str:
@@ -280,34 +258,12 @@ def merge_slots(
     if not isinstance(update, dict):
         return merged, ([] if update is None else ["slots is not an object"])
     by_name = {slot.name: slot for slot in defs}
-    money_extras = {
-        slot.name + suffix
-        for slot in defs
-        if slot.type == "money"
-        for suffix in (MONEY_AMOUNT_SUFFIX, MONEY_CURRENCY_SUFFIX)
-    }
     for name, raw in update.items():
-        if name in money_extras:
-            continue  # read together with the money slot itself
         slot = by_name.get(str(name))
         if slot is None:
             rejected.append(f"{name}: unknown slot")
             continue
-        if slot.type == "money" and not isinstance(raw, dict):
-            value: Optional[SlotValue] = money_value(
-                slot, raw, update.get(slot.name + MONEY_AMOUNT_SUFFIX), update.get(slot.name + MONEY_CURRENCY_SUFFIX)
-            )
-            old = merged.get(slot.name)
-            if (
-                isinstance(value, dict)
-                and isinstance(old, dict)
-                and value["amount"] is None
-                and old.get("amount") is not None
-                and value["text"] == old.get("text")
-            ):
-                continue  # same words as before; keep the number we already understood
-        else:
-            value = normalise_value(slot, raw)
+        value = normalise_value(slot, raw)
         if value is None:
             if raw is not None and str(raw).strip().lower() not in _UNKNOWN:
                 rejected.append(f"{name}: {raw!r} is not a valid value")
@@ -403,6 +359,11 @@ def parse_outcomes(data: Any, defs: tuple[SlotDef, ...]) -> tuple[tuple[OutcomeV
     return tuple(variants), problems
 
 
+def affects_outcome(slot: SlotDef, variants: tuple[OutcomeVariant, ...] = ()) -> bool:
+    """Can this slot's value change whether (or how) the caller qualifies?"""
+    return bool(slot.disqualifying) or any(name == slot.name for variant in variants for name, _ in variant.when)
+
+
 def compute_outcome(
     defs: tuple[SlotDef, ...],
     slots: dict[str, Optional[SlotValue]],
@@ -483,11 +444,7 @@ def reply_schema(defs: tuple[SlotDef, ...]) -> dict[str, Any]:
             properties[slot.name] = {"type": ["string", "null"], "enum": [*allowed, None]}
         elif slot.type == "number":
             properties[slot.name] = {"type": ["number", "null"]}
-        elif slot.type == "money":
-            properties[slot.name] = {"type": ["string", "null"]}
-            properties[slot.name + MONEY_AMOUNT_SUFFIX] = {"type": ["number", "null"]}
-            properties[slot.name + MONEY_CURRENCY_SUFFIX] = {"type": ["string", "null"]}
-        else:
+        else:  # text and money: one string; amounts are parsed from it by code
             properties[slot.name] = {"type": ["string", "null"]}
     return {
         "type": "object",

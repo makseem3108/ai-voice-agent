@@ -56,13 +56,20 @@ class FakeLLM:
         self.replies = list(replies or [])
         self.requests: list[list[dict[str, str]]] = []
         self.schemas: list[dict[str, Any]] = []
+        self.text_fallback: list[bool] = []
         self.cancelled = 0
         self.hold: Optional[asyncio.Event] = None  # when set: the request hangs until released
 
     async def reply_json(
-        self, messages: list[dict[str, str]], schema: dict[str, Any], usage: Optional[LLMUsage] = None
+        self,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any],
+        usage: Optional[LLMUsage] = None,
+        *,
+        text_fallback: bool = True,
     ) -> dict[str, Any]:
         self.requests.append(messages)
+        self.text_fallback.append(text_fallback)
         self.schemas.append(schema)
         if usage is not None:
             usage.requests += 1
@@ -149,6 +156,7 @@ class Rig:
         barge_confirm_s: float = 0.15,
         end_silence_s: float = 0.05,
         end_silence_max_s: float = 1.0,
+        end_hold_max_s: float = 1.0,
     ) -> None:
         self.llm = llm or FakeLLM()
         self.tts = tts or FakeTTS()
@@ -176,6 +184,7 @@ class Rig:
             barge_confirm_s=barge_confirm_s,
             end_silence_s=end_silence_s,
             end_silence_max_s=end_silence_max_s,
+            end_hold_max_s=end_hold_max_s,
         )
 
     def event(self, kind: str, text: str = "", end: float = 5.0) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import httpx
 import pytest
@@ -607,8 +607,9 @@ def test_reply_json_uses_strict_structured_output() -> None:
         return out, usage, llm
 
     out, usage, llm = run(scenario)
-    assert out == {"slots": {"owns_home": "no", "monthly_bill": None, "name": None}, "say": "Thanks."}
+    assert out == {"slots": {"owns_home": "no", "monthly_bill": None, "name": None}, "say": "Thanks.", "path": "json"}
     (body,) = seen
+    assert "tools" not in body
     assert body["response_format"] == {
         "type": "json_schema",
         "json_schema": {"name": "reply", "strict": True, "schema": reply_schema(DEFS)},
@@ -619,27 +620,49 @@ def test_reply_json_uses_strict_structured_output() -> None:
     assert llm.budget.remaining == 7000
 
 
-def test_reply_json_falls_back_to_json_mode_and_checks_the_result_itself() -> None:
-    formats: list[str] = []
+def request_mode(body: dict[str, Any]) -> str:
+    """Which of the two request shapes this is."""
+    return "function_call" if "tools" in body else body["response_format"]["type"]
+
+
+def tool_call(arguments: str) -> dict[str, Any]:
+    return {
+        "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{"type": "function", "function": {"name": "reply", "arguments": arguments}}]}}],
+        "usage": {"prompt_tokens": 400, "completion_tokens": 40},
+    }
+
+
+def test_reply_json_retries_with_a_forced_function_call_and_keeps_the_slots() -> None:
+    bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        formats.append(body["response_format"]["type"])
-        if body["response_format"]["type"] == "json_schema":
-            return httpx.Response(400, json={"error": {"message": "Generated JSON does not match the expected schema."}})
-        return httpx.Response(200, json=completion('{"say": "Hello there.", "slots": {}}'))
+        bodies.append(body)
+        if request_mode(body) == "json_schema":
+            return httpx.Response(400, json={"error": {"message": "Failed to generate JSON.", "failed_generation": "We install solar panels. Do you own the house?"}})
+        return httpx.Response(200, json=tool_call('{"slots": {"owns_home": "no", "monthly_bill": null, "name": null}, "say": "Hello there."}'))
 
     async def scenario() -> tuple[dict[str, Any], LLMUsage]:
         usage = LLMUsage()
-        return await groq(handler).reply_json([{"role": "user", "content": "hi"}], reply_schema(DEFS), usage), usage
+        llm = groq(handler)
+        llm.fallback_language = "en"
+        return await llm.reply_json([{"role": "user", "content": "hi"}], reply_schema(DEFS), usage), usage
 
     out, usage = run(scenario)
-    assert formats == ["json_schema", "json_object"]
-    assert out["say"] == "Hello there." and usage.requests == 2
+    assert [request_mode(b) for b in bodies] == ["json_schema", "function_call"]
+    # the function call wins over the clean plain text of the first attempt: it has the slots
+    assert out == {"slots": {"owns_home": "no", "monthly_bill": None, "name": None}, "say": "Hello there.", "path": "function_call"}
+    assert usage.requests == 2
+    second = bodies[1]
+    assert "response_format" not in second
+    assert second["tool_choice"] == {"type": "function", "function": {"name": "reply"}}
+    (tool,) = second["tools"]
+    assert tool["function"]["name"] == "reply" and tool["function"]["parameters"] == reply_schema(DEFS) and tool["function"]["strict"] is True
+    assert second["stream"] is False and second["max_completion_tokens"] >= 400
 
 
 @pytest.mark.parametrize("bad", ["not json at all", '["a list"]', '{"slots": {}}', '{"say": ""}', '{"say": 42}'])
-def test_reply_json_unusable_three_times_is_an_error(bad: str) -> None:
+def test_reply_json_unusable_both_ways_is_an_error(bad: str) -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -652,7 +675,7 @@ def test_reply_json_unusable_three_times_is_an_error(bad: str) -> None:
             await groq(handler).reply_json([{"role": "user", "content": "hi"}], reply_schema(DEFS))
 
     run(scenario)
-    assert calls == 3  # strict attempt, then two retries in plain JSON mode
+    assert calls == 2  # JSON mode, then the function call; no plain-text fallback without a language
 
 
 def test_reply_json_rate_limit_and_network_errors() -> None:
@@ -684,7 +707,8 @@ def test_hangup_cancelled_at_the_instant_the_closing_audio_ends_stays_cancelled(
         rig.event("StartOfTurn", "No")
         rig.event("EndOfTurn", "No thanks.")
         await until(lambda: rig.pacer.speaking and len(rig.of("ending")) == 1)  # closing line is playing
-        rig.event("StartOfTurn", "Wait")  # barge-in empties the queue and cancels the hang-up in the same instant
+        rig.event("StartOfTurn", "Wait")
+        rig.event("EndOfTurn", "Wait, what about batteries?")  # a real question empties the queue and cancels the hang-up in the same instant
         await asyncio.sleep(0.3)  # six silence windows
         await rig.agent.close()
         return rig
@@ -694,21 +718,25 @@ def test_hangup_cancelled_at_the_instant_the_closing_audio_ends_stays_cancelled(
     assert rig.kinds().count("hangup_cancelled") == 1 and rig.agent.summary()["outcome"] is None
 
 
-def test_reply_json_survives_two_transient_generation_failures() -> None:
-    """Seen live: Groq answered 400 'Failed to generate JSON' twice in a row for a
-    request that succeeded when sent again."""
-    formats: list[str] = []
+def test_reply_json_order_is_json_then_function_call_then_clean_text_then_error() -> None:
+    """Seen live: Groq answers 400 'Failed to generate JSON' and returns what the model wrote."""
+    modes: list[str] = []
+    prose = "Installation takes one to two days. Do you own the house, or do you rent?"
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        formats.append(body["response_format"]["type"])
+        modes.append(request_mode(body))
         assert body["max_completion_tokens"] >= 400  # headroom for slots + sentence + hidden reasoning
-        if len(formats) < 3:
-            return httpx.Response(400, json={"error": {"message": "Failed to generate JSON.", "failed_generation": "{\"slots\": {"}})
-        return httpx.Response(200, json=completion('{"slots": {}, "say": "One to two days."}'))
+        generated = prose if request_mode(body) == "function_call" else "{\"slots\": {"
+        return httpx.Response(400, json={"error": {"message": "Failed to generate JSON.", "failed_generation": generated}})
 
-    async def scenario() -> dict[str, Any]:
-        return await groq(handler).reply_json([{"role": "user", "content": "hi"}], reply_schema(DEFS))
+    async def scenario(language: Optional[str], **kwargs: Any) -> dict[str, Any]:
+        llm = groq(handler)
+        llm.fallback_language = language
+        return await llm.reply_json([{"role": "user", "content": "hi"}], reply_schema(DEFS), **kwargs)
 
-    assert run(scenario)["say"] == "One to two days."
-    assert formats == ["json_schema", "json_object", "json_object"]
+    assert run(lambda: scenario("en")) == {"say": prose, "path": "text_fallback"}  # third choice: no slots
+    assert modes == ["json_schema", "function_call"]
+    for language, kwargs in (("en", {"text_fallback": False}), (None, {}), ("he", {})):
+        with pytest.raises(LLMError, match="no usable reply after retry"):  # fourth: the caller apologises
+            run(lambda: scenario(language, **kwargs))

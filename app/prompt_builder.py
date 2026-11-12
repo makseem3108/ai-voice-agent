@@ -26,8 +26,6 @@ from .slots import (
     ANSWER,
     COLLECT,
     FINAL,
-    MONEY_AMOUNT_SUFFIX,
-    MONEY_CURRENCY_SUFFIX,
     OUTCOME_NOT_FIT,
     Plan,
     SlotDef,
@@ -47,12 +45,7 @@ def _slot_line(slot: SlotDef) -> str:
     kind = " | ".join(allowed) if allowed is not None else ("a number" if slot.type == "number" else "short text")
     note = f" - {slot.description}" if slot.description else ""
     if slot.type == "money":
-        return (
-            f"- {slot.name}: the amount in the caller's own words{note}\n"
-            f"- {slot.name}{MONEY_AMOUNT_SUFFIX}: that amount as a plain number, or null if no number was said\n"
-            f"- {slot.name}{MONEY_CURRENCY_SUFFIX}: three-letter currency code the caller named "
-            f"(shekels or NIS = ILS, dollars = USD, euros = EUR), or null if they named none"
-        )
+        kind = "short text, the amount as the caller said it"
     return f"- {slot.name}: {kind}{note}"
 
 
@@ -92,15 +85,41 @@ RULES
 
 
 def _known(slots: dict[str, Any]) -> str:
-    known = {name: value for name, value in slots.items() if value is not None}
+    # money slots are stored as {text, amount, currency}; the model only ever sees the text
+    known = {
+        name: (value.get("text") if isinstance(value, dict) else value)
+        for name, value in slots.items()
+        if value is not None
+    }
     return json.dumps(known, ensure_ascii=False) if known else "nothing yet"
 
 
-def build_directive(plan: Plan, slots: dict[str, Any], *, replanned: bool = False) -> str:
-    """The instruction for this turn. ``slots`` are the values known so far."""
+#: Ends every instruction. Without it the model sometimes answers a caller's
+#: question in plain sentences instead of JSON (measured with scripts/replay_llm.py).
+FORMAT_REMINDER = '\nReply with exactly one JSON object and nothing else: {"slots": {...}, "say": "..."}'
+
+
+def build_directive(plan: Plan, slots: dict[str, Any], *, replanned: bool = False, recheck: bool = False) -> str:
+    """The instruction for this turn. ``slots`` are the values known so far.
+
+    ``recheck``: the previous turn was answered without recording any slots
+    (plain-text fallback) and the slot being asked decides the outcome, so the
+    model must settle that slot now - from what was already said, or by asking
+    again - before anything else.
+    """
+    return _instruction(plan, slots, replanned, recheck) + FORMAT_REMINDER
+
+
+def _instruction(plan: Plan, slots: dict[str, Any], replanned: bool, recheck: bool = False) -> str:
     head = f"INSTRUCTION (from the phone system). Known so far: {_known(slots)}.\n"
     if plan.kind == COLLECT and plan.target is not None:
         ask_now = f'ask, in your own words: "{plan.target.question}"'
+        if recheck:
+            return head + (
+                f"Still needed: {plan.target.name}. The caller's earlier answer to this may not have been recorded. "
+                f"If they have clearly stated it anywhere in the conversation, fill it. If not, ask again, in your own "
+                f'words: "{plan.target.question}" Ask about nothing else.'
+            )
         if replanned or plan.next is None:
             return head + (
                 f"Still needed: {plan.target.name}. Briefly respond to what the caller just said "

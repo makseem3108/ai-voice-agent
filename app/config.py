@@ -67,6 +67,8 @@ class Settings:
     #: Debug only: save the caller's audio per call. Files are deleted after 7 days.
     debug_record_audio: bool = False
     recordings_dir: Path = PROJECT_ROOT / "data" / "recordings"
+    #: Where Asterisk leaves per-call RTP statistics at hang-up (see asterisk/extensions.conf).
+    rtp_stats_dir: Path = Path("/var/lib/voice-agent-rtp")
 
     #: Where per-call JSONL transcripts are written.
     calls_dir: Path = PROJECT_ROOT / "data" / "calls"
@@ -181,6 +183,7 @@ def load_settings(
         end_silence_max_ms=_int(values, "END_SILENCE_MAX_MS", 3000, 0, 15000),
         debug_record_audio=_bool(values, "DEBUG_RECORD_AUDIO", False),
         recordings_dir=Path(values["RECORDINGS_DIR"]) if values.get("RECORDINGS_DIR") else PROJECT_ROOT / "data" / "recordings",
+        rtp_stats_dir=Path(values.get("RTP_STATS_DIR") or "/var/lib/voice-agent-rtp"),
         calls_dir=Path(calls_dir) if calls_dir else PROJECT_ROOT / "data" / "calls",
         tts_cache_dir=Path(values["TTS_CACHE_DIR"]) if values.get("TTS_CACHE_DIR") else PROJECT_ROOT / "data" / "tts_cache",
     )

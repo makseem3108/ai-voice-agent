@@ -10,6 +10,11 @@ the check is predictable and testable.
 * ``"goodbye"`` - an explicit farewell ("bye", "have a nice day", "talk later")
 * ``"decline"`` - "no / that's all / nothing else / I'm good"
 * ``None``      - anything else: a statement, a question, an answer
+
+``interrupts_closing`` answers a narrower question: the closing line is being
+spoken and the caller said something - is it a real new request (then the bot
+stops and listens), or just "ok / thanks / bye" or talk that is not meant for
+the bot (then the closing line simply finishes)?
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ _GOODBYE = re.compile(
     r"\b("
     r"bye|goodbye|good bye|bye bye|see you|see ya|talk to you later|talk later|take care|"
     r"have a (good|nice|great|lovely) (day|one|evening|night|weekend)|good night|"
-    r"i have to go|i've got to go|i gotta go|i need to go|hang up|end the call"
+    r"i have to go|i've got to go|i gotta go|i need to go|(?<!don't )(?<!do not )(?<!dont )hang up|end the call"
     r")\b"
 )
 #: Phrases that mean "nothing more" wherever they appear in the reply.
@@ -68,3 +73,31 @@ def caller_reply_kind(text: str) -> Optional[str]:
     if _THANKS_ONLY.match(norm):
         return DECLINE
     return None
+
+
+#: Things a caller says when they do want something more from the bot.
+_NEW_REQUEST = re.compile(
+    r"\b("
+    r"wait|hold on|hang on|one more|another (question|thing)|one (other|last) (question|thing)|"
+    r"i have a question|i (also )?(want|wanted|need|would like|'d like) to (ask|know)|"
+    r"can i ask|let me ask|tell me|what about|how about|actually|before you go|don'?t hang up|sorry but"
+    r")\b"
+)
+
+
+def interrupts_closing(text: str) -> bool:
+    """Should these words, said while the closing line is playing, stop it?
+
+    Only a real new request does: a question, or a phrase like "wait" or "one
+    more thing". A goodbye, a thank-you, "ok", an echo of the bot or a remark
+    to someone else in the room does not - the bot finishes the line and
+    hangs up. Decided from the transcript alone.
+    """
+    norm = _normalise(text or "")
+    if not norm:
+        return False
+    if _NEW_REQUEST.search(norm):
+        return True
+    if caller_reply_kind(text) is not None:
+        return False  # "no thanks", "bye", "ok thank you"
+    return "?" in (text or "") or bool(_QUESTION_WORDS.search(norm))

@@ -279,8 +279,9 @@ def test_turn_and_bot_log_lines() -> None:
     turn = {"type": "turn", "turn": 3, "stt_ms": 210.4, "llm_first_token_ms": 340.0,
             "tts_first_audio_ms": 260.2, "total_ms": 830.9, "eager": True}
     assert format_record(turn) == (
-        "[turn 3] stt_ms=210 llm_first_token_ms=340 tts_first_audio_ms=260 total_ms=831 eager=yes"
+        "[turn 3] stt_ms=210 llm_first_token_ms=340 tts_first_audio_ms=260 total_ms=831 eager=yes llm_path=n/a"
     )
+    assert format_record({**turn, "llm_path": "json+function_call"}).endswith("eager=yes llm_path=json+function_call")
     assert format_record({"type": "user", "text": "Hi."}) == "[user] Hi."
     assert format_record({"type": "bot", "text": "Hello."}) == "[bot]  Hello."
     assert format_record({"type": "bot", "text": "Hel", "interrupted": True}) == "[bot]  Hel (interrupted)"

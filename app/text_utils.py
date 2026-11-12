@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from typing import Optional
 
 #: Words ending in a period that do not end a sentence.
 _ABBREVIATIONS = frozenset(
@@ -79,3 +81,39 @@ class SentenceSplitter:
         last = words[-1].lstrip("\"'([").lower()
         # single letters ("J. Smith") and known abbreviations
         return last in _ABBREVIATIONS or (len(last) == 1 and last.isalpha() and last not in ("a", "i"))
+
+
+# ---------------------------------------------------------------------------
+# Plain-text replies from a model that was asked for JSON
+_FALLBACK_MAX_CHARS = 300
+_FORBIDDEN_CHARS = set("{}[]<>`*#|\\_=~")
+_KEY_LIKE_RE = re.compile(r"\"\s*:|\b(slots|say)\b\s*[:=]", re.IGNORECASE)
+_SCRIPTS = {"he": "HEBREW", "ar": "ARABIC"}  # every other language: Latin letters
+
+
+def clean_fallback_text(text: object, language: str = "en") -> Optional[str]:
+    """``text`` tidied up if it is safe to speak as it stands, else None.
+
+    Used when the language model answers in plain sentences although it was
+    asked for JSON. The sentence is usually a perfectly good reply, but it is
+    only spoken if it is *clean*: not empty, shorter than 300 characters, free
+    of JSON / markup fragments, and written in the profile's language (checked
+    by alphabet: at least 80 % of its letters).
+    """
+    if not isinstance(text, str):
+        return None
+    tidy = " ".join(text.split())
+    if not tidy or len(tidy) >= _FALLBACK_MAX_CHARS:
+        return None
+    if any(ch in _FORBIDDEN_CHARS for ch in tidy) or _KEY_LIKE_RE.search(tidy):
+        return None
+    if tidy[0] in "-•\"'" and len(tidy) > 1 and tidy[1] in " -":
+        return None  # a list item
+    letters = [ch for ch in tidy if ch.isalpha()]
+    if len(letters) < 3:
+        return None
+    script = _SCRIPTS.get(language.split("-")[0].lower(), "LATIN")
+    in_script = sum(1 for ch in letters if unicodedata.name(ch, "").startswith(script))
+    if in_script / len(letters) < 0.8:
+        return None
+    return tidy

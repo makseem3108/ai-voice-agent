@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable, Optional, Protocol, Union
 from urllib.parse import urlencode
 
 from .audiosocket import SAMPLE_RATE_HZ, audio_duration_s
+from .speech import SttError
 
 log = logging.getLogger("voice_agent.stt")
 
@@ -99,11 +100,6 @@ class UtteranceEnd:
 class StreamMetadata:
     request_id: str
     duration: float  # audio seconds Deepgram processed
-
-
-@dataclass(frozen=True)
-class SttError:
-    message: str
 
 
 @dataclass(frozen=True)

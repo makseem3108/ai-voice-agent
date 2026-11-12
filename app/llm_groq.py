@@ -10,10 +10,17 @@ from typing import Any, AsyncIterator, Mapping, Optional
 
 import httpx
 
+from .text_utils import clean_fallback_text
+
 log = logging.getLogger("voice_agent.llm")
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 JSON_REPLY_MAX_TOKENS = 400
+
+#: How a structured reply was obtained (see GroqLLM.reply_json), best first.
+PATH_JSON = "json"
+PATH_FUNCTION = "function_call"
+PATH_TEXT = "text_fallback"
 
 
 class LLMError(Exception):
@@ -116,6 +123,9 @@ class GroqLLM:
         self._max_tokens = max_tokens
         self._temperature = temperature
         self.budget = TokenBudget()
+        #: Language of the call. When set, a rejected JSON reply whose text is
+        #: clean and in this language is used as the spoken reply (see reply_json).
+        self.fallback_language: Optional[str] = None
 
     def _body(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -143,29 +153,62 @@ class GroqLLM:
             usage.cached_tokens += int(details.get("cached_tokens") or 0)
 
     async def reply_json(
-        self, messages: list[dict[str, str]], schema: dict[str, Any], usage: Optional[LLMUsage] = None
+        self,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any],
+        usage: Optional[LLMUsage] = None,
+        *,
+        text_fallback: bool = True,
     ) -> dict[str, Any]:
-        """One complete reply as a JSON object with at least a non-empty ``say`` string.
+        """One complete reply as a dict with a non-empty ``say`` string, and how we got it.
 
-        First choice is strict structured output: the provider constrains the
-        model to ``schema``, so the reply is valid by construction. (On Groq
-        structured output is delivered in one piece, not token by token.) If
-        that request is rejected or the reply is unusable we retry in plain
-        JSON mode and check the result ourselves ("parse and retry"), up to
-        twice: Groq occasionally answers 400 "Failed to generate JSON" for a
-        request that works when simply sent again.
+        The model is asked for ``{"slots": {...}, "say": "..."}``. Groq's JSON
+        mode for this model fails now and then: the model writes a good answer
+        as plain sentences and the API rejects it with HTTP 400 "Failed to
+        generate JSON" (it happens more on caller questions; Groq documents no
+        fix). So there are three ways to get a reply, tried in this order, and
+        the one that worked is returned as ``reply["path"]``:
+
+        1. ``json``           - strict structured output (``json_schema``).
+        2. ``function_call``  - the same schema offered as a function the model
+           must call. A different mechanism, so it usually works when 1 did
+           not, and it still delivers the slots.
+        3. ``text_fallback``  - the plain sentences the model wrote, if they are
+           *clean* (:func:`~app.text_utils.clean_fallback_text`: short, no JSON
+           or markup fragments, in the call's language). No ``slots`` then, so
+           the facts of this turn have to be picked up on the next one.
+           ``text_fallback=False`` skips this for requests whose whole point is
+           the slots.
+
+        If none works, :class:`LLMError` is raised and the caller apologises.
         """
-        attempts: list[dict[str, Any]] = [
-            {"type": "json_schema", "json_schema": {"name": "reply", "strict": True, "schema": schema}},
-            {"type": "json_object"},
-            {"type": "json_object"},
+        attempts: list[tuple[str, dict[str, Any]]] = [
+            (PATH_JSON, {"response_format": {"type": "json_schema", "json_schema": {"name": "reply", "strict": True, "schema": schema}}}),
+            (
+                PATH_FUNCTION,
+                {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "reply",
+                                "description": "Give your reply to the phone system.",
+                                "strict": True,
+                                "parameters": schema,
+                            },
+                        }
+                    ],
+                    "tool_choice": {"type": "function", "function": {"name": "reply"}},
+                },
+            ),
         ]
         problem = "no attempt made"
-        for response_format in attempts:
+        plain_text: Optional[str] = None  # the first clean plain-text answer seen on the way
+        for path, extra in attempts:
             body = self._body(messages)
             body["stream"] = False
             body.pop("stream_options", None)
-            body["response_format"] = response_format
+            body.update(extra)
             # Room for the slots object, the sentence and the model's (hidden) reasoning.
             body["max_completion_tokens"] = max(self._max_tokens, JSON_REPLY_MAX_TOKENS)
             if usage is not None:
@@ -177,8 +220,8 @@ class GroqLLM:
             except httpx.HTTPError as exc:
                 raise LLMError(f"Groq request failed: {type(exc).__name__}") from None
             self.budget.update(response.headers)
+            generated = ""
             if response.status_code != 200:
-                generated = ""
                 try:
                     error = response.json()["error"]
                     detail = error["message"]
@@ -187,27 +230,38 @@ class GroqLLM:
                     detail = response.text[:200]
                 problem = f"Groq HTTP {response.status_code}: {' '.join(str(detail).split())[:200]}"
                 log.warning(
-                    "structured reply attempt (%s) failed: %s%s",
-                    response_format["type"],
+                    "reply attempt (%s) failed: %s%s",
+                    path,
                     problem,
                     f" | model produced: {' '.join(generated.split())[:200]!r}" if generated else "",
                 )
                 if response.status_code == 429:
                     self.budget.exhausted()
-                if response.status_code == 400:
-                    continue  # schema rejected or output failed validation: try plain JSON mode
-                raise LLMError(problem)
-            try:
-                data = response.json()
-                self._count(data.get("usage"), usage)
-                content = data["choices"][0]["message"]["content"]
-                reply = json.loads(content)
-            except (ValueError, KeyError, IndexError, TypeError):
-                problem = "the reply was not valid JSON"
-                continue
-            if isinstance(reply, dict) and isinstance(reply.get("say"), str) and reply["say"].strip():
-                return reply
-            problem = "the reply had no 'say' text"
+                if response.status_code != 400:
+                    raise LLMError(problem)
+                # 400: the output failed validation (or the mode was refused). Try the next way.
+            else:
+                try:
+                    data = response.json()
+                    self._count(data.get("usage"), usage)
+                    message = data["choices"][0]["message"]
+                    calls = message.get("tool_calls") or []
+                    content = calls[0]["function"]["arguments"] if calls else message.get("content")
+                    generated = content if isinstance(content, str) else ""
+                    reply = json.loads(content)
+                except (ValueError, KeyError, IndexError, TypeError):
+                    problem = "the reply was not valid JSON"
+                    reply = None
+                if isinstance(reply, dict) and isinstance(reply.get("say"), str) and reply["say"].strip():
+                    reply["path"] = path
+                    return reply
+                if reply is not None:
+                    problem = "the reply had no 'say' text"
+                    generated = ""
+            if plain_text is None and text_fallback and self.fallback_language and generated:
+                plain_text = clean_fallback_text(generated, self.fallback_language)
+        if plain_text is not None:
+            return {"say": plain_text, "path": PATH_TEXT}
         raise LLMError(f"no usable reply after retry ({problem})")
 
     async def stream(self, messages: list[dict[str, str]], usage: Optional[LLMUsage] = None) -> AsyncIterator[str]:

@@ -42,12 +42,12 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
 from .audio_out import Pacer
-from .intent import DECLINE, GOODBYE, caller_reply_kind
-from .llm_groq import LLMError, LLMUsage
+from .intent import DECLINE, GOODBYE, caller_reply_kind, interrupts_closing
+from .llm_groq import PATH_FUNCTION, PATH_JSON, PATH_TEXT, LLMError, LLMUsage
 from .profiles import Profile
 from .prompt_builder import ANYTHING_ELSE_QUESTION, build_directive, incomplete_closing
 from .slots import (
@@ -60,6 +60,7 @@ from .slots import (
     OUTCOME_QUALIFIED,
     Plan,
     SlotValue,
+    affects_outcome,
     compute_outcome,
     empty_slots,
     make_plan,
@@ -67,18 +68,19 @@ from .slots import (
     plans_consistent,
     reply_schema,
 )
-from .stt_deepgram import AudioClock, SttError
-from .stt_flux import (
+from .speech import (
     EAGER_END_OF_TURN,
     END_OF_TURN,
     START_OF_TURN,
     TURN_RESUMED,
-    FluxEvent,
-    FluxInfo,
+    SpeechEvent,
+    SttError,
+    SttInfo,
+    TTSError,
     TurnEvent,
 )
+from .stt_deepgram import AudioClock
 from .text_utils import SentenceSplitter, clean_for_speech
-from .tts_aura import TTSError
 
 log = logging.getLogger("voice_agent.agent")
 
@@ -150,7 +152,12 @@ def fixed_phrases(profile: Profile) -> list[str]:
 
 class LLM(Protocol):
     async def reply_json(
-        self, messages: list[dict[str, str]], schema: dict[str, Any], usage: Optional[LLMUsage] = None
+        self,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any],
+        usage: Optional[LLMUsage] = None,
+        *,
+        text_fallback: bool = True,
     ) -> dict[str, Any]: ...
 
 
@@ -193,6 +200,9 @@ class TurnMetrics:
     llm_first_token_ms: Optional[float] = None
     tts_first_audio_ms: Optional[float] = None
     total_ms: Optional[float] = None
+    #: How the model's reply was obtained: json, function_call or text_fallback
+    #: (joined with "+" when the turn needed two requests).
+    llm_path: Optional[str] = None
 
 
 @dataclass(eq=False)
@@ -218,6 +228,17 @@ class _Job:
     rejected: list[str] = field(default_factory=list)
     replanned: bool = False
     dropped_sentences: int = 0
+    #: How each reply of this job was obtained (json / function_call / text_fallback).
+    paths: list[str] = field(default_factory=list)
+
+    @property
+    def llm_path(self) -> Optional[str]:
+        return "+".join(self.paths) or None
+
+    @property
+    def spoke_plain_text(self) -> bool:
+        """The reply being spoken came through the plain-text fallback: no slots were read."""
+        return bool(self.paths) and self.paths[-1] == PATH_TEXT
 
 
 def _round(value: Optional[float]) -> Optional[float]:
@@ -250,6 +271,7 @@ class Agent:
         barge_confirm_s: float = 2.5,
         end_silence_s: float = 1.5,
         end_silence_max_s: float = 3.0,
+        end_hold_max_s: float = 5.0,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._profile = profile
@@ -288,6 +310,12 @@ class Agent:
         self.errors = 0
         self.tts_chars = 0
         self.replans = 0
+        self.json_fallbacks = 0
+        #: How many replies came through each path (see GroqLLM.reply_json).
+        self.llm_paths: dict[str, int] = {PATH_JSON: 0, PATH_FUNCTION: 0, PATH_TEXT: 0}
+        #: Set after a plain-text fallback turn that was asking for a slot which
+        #: decides the outcome: that slot is settled first on the next turn.
+        self._recheck: Optional[str] = None
         self.llm_usage = LLMUsage()
 
         self._job: Optional[_Job] = None
@@ -308,6 +336,11 @@ class Agent:
         self._end_token: Optional[object] = None
         self._end_deadline = 0.0
         self._end_wait_started = 0.0  # 0 = not in the post-closing silence wait
+        #: The caller started saying something during / after the closing line.
+        #: The line keeps playing, but the hang-up waits (until this time at most)
+        #: for the transcript, which decides whether it was a real new request.
+        self._end_hold_until = 0.0
+        self._end_hold_max_s = end_hold_max_s
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -348,7 +381,9 @@ class Agent:
         if detector is None or self._closing:
             return
         try:
-            if self._pacer.speaking and not self._pacer.paused:
+            if self._end_task is not None and self._pacer.speaking:
+                detector.reset()  # the closing line is never paused on sound alone
+            elif self._pacer.speaking and not self._pacer.paused:
                 if detector.feed(frame):
                     self._local_pause(detector.last_rms)
                     detector.reset()
@@ -412,26 +447,25 @@ class Agent:
         return paused_ms
 
     # ------------------------------------------------------------------ speech-to-text events
-    def on_stt_event(self, event: FluxEvent, arrival_wall: float) -> None:
-        """Entry point for every Flux event. Synchronous and never raises."""
+    def on_stt_event(self, event: SpeechEvent, arrival_wall: float) -> None:
+        """Entry point for every speech-to-text event. Synchronous and never raises."""
         try:
             if isinstance(event, SttError):
                 self._error("stt", event.message)
-            elif isinstance(event, FluxInfo):
+            elif isinstance(event, SttInfo):
                 if event.type == "Warning":
-                    log.warning("Flux warning: %s", event.detail)
+                    log.warning("speech-to-text warning: %s", event.detail)
             elif isinstance(event, TurnEvent) and not self._closing:
                 self._record_stt_event(event, arrival_wall)
-                if event.event == START_OF_TURN:
-                    self._cancel_ending()
+                if self._end_task is not None:
+                    self._on_event_during_closing(event, arrival_wall)
+                elif event.event == START_OF_TURN:
                     self._on_start_of_turn()
                 elif event.event == EAGER_END_OF_TURN:
                     self._on_eager_end_of_turn(event)
                 elif event.event == TURN_RESUMED:
                     self._on_turn_resumed()
                 elif event.event == END_OF_TURN:
-                    if event.transcript:
-                        self._cancel_ending()
                     self._on_end_of_turn(event, arrival_wall)
         except Exception:
             log.exception("agent failed to handle a speech event")
@@ -454,6 +488,30 @@ class Agent:
                 "bot_speaking": self._pacer.speaking,
             }
         )
+
+    def _on_event_during_closing(self, event: TurnEvent, arrival_wall: float) -> None:
+        """The caller makes a sound while the closing line plays or just after it.
+
+        Sound alone changes nothing: the line is not paused, cut or restarted.
+        The hang-up only waits until we know what was said. "Bye", "thanks",
+        "ok" or a remark to someone else is ignored and the call ends as
+        planned; a real new request (a question, "wait", "one more thing")
+        stops the closing and is answered like any other turn.
+        """
+        if event.event == START_OF_TURN:
+            self._end_hold_until = time.monotonic() + self._end_hold_max_s
+            return
+        if event.event != END_OF_TURN:
+            return  # no head starts while closing
+        self._end_hold_until = 0.0
+        text = event.transcript
+        if not text:
+            return
+        if interrupts_closing(text) and self._ends_the_call(text) is None:
+            self._cancel_ending()
+            self._on_end_of_turn(event, arrival_wall)  # clears the rest of the closing audio
+            return
+        self._record({"type": "user", "turn": None, "text": text, "ignored": "closing"})
 
     def _on_start_of_turn(self) -> None:
         job = self._job
@@ -598,10 +656,17 @@ class Agent:
         started = self._now()
         try:
             reply = await asyncio.wait_for(
-                self._llm.reply_json(self._messages(job, Plan(FINAL), slots, replanned=False), self._schema, self.llm_usage),
+                # Only the slots matter here, so a plain-text reply is of no use.
+                self._llm.reply_json(
+                    self._messages(job, Plan(FINAL), slots, replanned=False),
+                    self._schema,
+                    self.llm_usage,
+                    text_fallback=False,
+                ),
                 FINAL_EXTRACT_TIMEOUT_S,
             )
             job.raw.append(reply)
+            job.paths.append(str(reply.get("path") or PATH_JSON))
             slots, job.rejected = merge_slots(self._defs, slots, reply.get("slots"))
         except asyncio.CancelledError:
             raise
@@ -621,13 +686,15 @@ class Agent:
             self._record_raw(job, job.metrics.index if job.metrics else None, complete=True)
         self._close_call(self._outcome() or OUTCOME_INCOMPLETE, job.metrics, job)
 
-    def _messages(self, job: _Job, plan: Plan, slots: dict[str, Optional[SlotValue]], *, replanned: bool) -> list[dict[str, str]]:
+    def _messages(
+        self, job: _Job, plan: Plan, slots: dict[str, Optional[SlotValue]], *, replanned: bool, recheck: bool = False
+    ) -> list[dict[str, str]]:
         # Static prompt first, conversation next, this turn's instruction last:
         # the prefix never changes, so it stays cacheable.
         return (
             [{"role": "system", "content": self._system_prompt}]
             + job.history
-            + [{"role": "system", "content": build_directive(plan, slots, replanned=replanned)}]
+            + [{"role": "system", "content": build_directive(plan, slots, replanned=replanned, recheck=recheck)}]
         )
 
     async def _run_job(self, job: _Job) -> None:
@@ -636,9 +703,17 @@ class Agent:
             slots_before = dict(self.slots)
             announced = self.announced
             plan = make_plan(self._defs, slots_before, announced, self._variants)
+            # The last turn was answered without reading any slots, and it was asking
+            # for a slot that decides the outcome: settle that slot before moving on.
+            recheck = plan.kind == COLLECT and plan.target is not None and plan.target.name == self._recheck
+            if recheck:
+                plan = replace(plan, next=None)  # any progress then needs a fresh reply
             started = self._now()
-            reply = await self._llm.reply_json(self._messages(job, plan, slots_before, replanned=False), self._schema, self.llm_usage)
+            reply = await self._llm.reply_json(
+                self._messages(job, plan, slots_before, replanned=False, recheck=recheck), self._schema, self.llm_usage
+            )
             job.raw.append(reply)
+            job.paths.append(str(reply.get("path") or PATH_JSON))
             merged, job.rejected = merge_slots(self._defs, slots_before, reply.get("slots"))
             plan_after = make_plan(self._defs, merged, announced, self._variants)
             if not plans_consistent(plan, plan_after):
@@ -650,6 +725,7 @@ class Agent:
                 plan = plan_after
                 reply = await self._llm.reply_json(self._messages(job, plan, merged, replanned=True), self._schema, self.llm_usage)
                 job.raw.append(reply)
+                job.paths.append(str(reply.get("path") or PATH_JSON))
                 merged, more = merge_slots(self._defs, merged, reply.get("slots"))
                 job.rejected += more
             job.llm_first_token_ms = (self._now() - started) * 1000.0
@@ -727,6 +803,17 @@ class Agent:
             self.slots = job.slots_after
         if announced and job.plan is not None and job.plan.kind == ANNOUNCE:
             self.announced = job.plan.outcome
+        plan = job.plan
+        if (
+            job.spoke_plain_text
+            and plan is not None
+            and plan.kind == COLLECT
+            and plan.target is not None
+            and affects_outcome(plan.target, self._variants)
+        ):
+            self._recheck = plan.target.name  # see _run_job
+        elif job.paths:
+            self._recheck = None
         self._record_state(job)
 
     def _record_state(self, job: Optional[_Job] = None) -> None:
@@ -742,6 +829,8 @@ class Agent:
                 "phase": plan.kind,
                 "next_slot": plan.target.name if plan.target is not None else None,
                 "replanned": bool(job and job.replanned),
+                "llm_path": job.llm_path if job else None,
+                "recheck": self._recheck,
                 "rejected": list(job.rejected) if job else [],
             }
         )
@@ -769,6 +858,13 @@ class Agent:
                 "dropped_sentences": job.dropped_sentences,
             }
         )
+        for path in job.paths:
+            self.llm_paths[path] = self.llm_paths.get(path, 0) + 1
+        if job.spoke_plain_text:
+            # The model wrote plain sentences instead of JSON; they were clean, so they
+            # were spoken. Slots are unchanged this turn.
+            self.json_fallbacks += 1
+            self._record({"type": "llm_json_fallback", "turn": turn, "text": str(job.raw[-1].get("say") or "")})
 
     def _cancel_job(self, job: _Job, *, interrupted: bool) -> None:
         job.cancelled = True
@@ -856,6 +952,7 @@ class Agent:
         self._end_task = None
         self._end_token = None
         self._end_wait_started = 0.0
+        self._end_hold_until = 0.0
         self.outcome = None
         task.cancel()
         if not silent:
@@ -894,8 +991,16 @@ class Agent:
             self._end_wait_started = time.monotonic()
             self._end_deadline = self._end_wait_started + self._end_silence_s
             while True:
-                remaining = self._end_deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = self._end_deadline - now
                 if remaining <= 0:
+                    if now < self._end_hold_until:
+                        # The caller is in the middle of saying something: wait for
+                        # the transcript before hanging up (see _on_event_during_closing).
+                        await asyncio.sleep(0.05)
+                        if not still_wanted():
+                            return
+                        continue
                     break
                 await asyncio.sleep(remaining)
                 if not still_wanted():
@@ -922,6 +1027,7 @@ class Agent:
         if job is not None:
             m.llm_first_token_ms = job.llm_first_token_ms
             m.tts_first_audio_ms = job.tts_first_audio_ms
+            m.llm_path = job.llm_path
         if m.speech_end_wall is not None:
             m.total_ms = max(0.0, (self._now() - m.speech_end_wall) * 1000.0)
         self.turns.append(m)
@@ -934,6 +1040,7 @@ class Agent:
                 "tts_first_audio_ms": _round(m.tts_first_audio_ms),
                 "total_ms": _round(m.total_ms),
                 "eager": m.eager,
+                "llm_path": m.llm_path,
             }
         )
 
@@ -951,6 +1058,8 @@ class Agent:
             "computed_outcome": self._outcome(),
             "slots": dict(self.slots),
             "replans": self.replans,
+            "json_fallbacks": self.json_fallbacks,
+            "llm_paths": dict(self.llm_paths),
             "errors": self.errors,
             "llm_requests": self.llm_usage.requests,
             "llm_tokens": self.llm_usage.total_tokens,

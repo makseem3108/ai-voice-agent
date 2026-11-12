@@ -23,14 +23,24 @@ from typing import Any, Optional, Union
 from urllib.parse import urlencode
 
 from .audiosocket import SAMPLE_RATE_HZ, audio_duration_s
+from .speech import (  # noqa: F401  (event names are re-exported for existing imports)
+    EAGER_END_OF_TURN,
+    END_OF_TURN,
+    START_OF_TURN,
+    TURN_RESUMED,
+    UPDATE,
+    SpeechEvent,
+    SpeechEventHandler,
+    SttError,
+    SttInfo,
+    TurnEvent,
+)
 from .stt_deepgram import (
     CLOSE_GRACE_S,
     CONNECT_TIMEOUT_S,
     MAX_QUEUED_FRAMES,
     AudioClock,
     Connector,
-    EventHandler,
-    SttError,
     WebSocketLike,
     _describe,
     _websockets_connect,
@@ -41,13 +51,6 @@ log = logging.getLogger("voice_agent.stt")
 FLUX_URL = "wss://api.deepgram.com/v2/listen"
 #: Deepgram recommends ~80 ms chunks for Flux: 4 AudioSocket frames of 20 ms.
 CHUNK_BYTES = 1280
-
-START_OF_TURN = "StartOfTurn"
-UPDATE = "Update"
-EAGER_END_OF_TURN = "EagerEndOfTurn"
-TURN_RESUMED = "TurnResumed"
-END_OF_TURN = "EndOfTurn"
-
 
 @dataclass(frozen=True)
 class FluxParams:
@@ -78,33 +81,9 @@ class FluxParams:
         return f"{FLUX_URL}?{urlencode(self.query())}"
 
 
-@dataclass(frozen=True)
-class TurnEvent:
-    """A Flux ``TurnInfo`` message."""
-
-    event: str
-    turn_index: int
-    transcript: str
-    eot_confidence: float = 0.0
-    audio_window_end: float = 0.0  # audio seconds
-    audio_window_start: float = 0.0
-    last_word_end: Optional[float] = None  # audio seconds
-
-    @property
-    def speech_end(self) -> float:
-        """Best estimate (audio seconds) of when the caller's last word ended."""
-        return self.last_word_end if self.last_word_end is not None else self.audio_window_end
-
-
-@dataclass(frozen=True)
-class FluxInfo:
-    """Connected / Warning / other non-turn messages."""
-
-    type: str
-    detail: str = ""
-
-
-FluxEvent = Union[TurnEvent, FluxInfo, SttError]
+#: Old names, kept so existing imports keep working.
+FluxInfo = SttInfo
+FluxEvent = SpeechEvent
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -146,13 +125,18 @@ def parse_flux_message(raw: Union[str, bytes]) -> FluxEvent:
 
 
 class FluxStream:
-    """One Flux stream (= one call): 20 ms frames in, turn events out."""
+    """One Flux stream (= one call): 20 ms frames in, turn events out.
+
+    Implements :class:`~app.speech.STTProvider`.
+    """
+
+    name = "flux"
 
     def __init__(
         self,
         api_key: str,
         params: FluxParams,
-        on_event: EventHandler,
+        on_event: SpeechEventHandler,
         clock: Optional[AudioClock] = None,
         connect: Connector = _websockets_connect,
     ) -> None:
@@ -165,6 +149,14 @@ class FluxStream:
         self._task: Optional[asyncio.Task[None]] = None
         self.failed = False
         self.dropped_frames = 0
+
+    @property
+    def model(self) -> str:
+        return self._params.model
+
+    @property
+    def supports_eager(self) -> bool:
+        return self._params.eager_eot_threshold > 0
 
     def start(self) -> None:
         self._task = asyncio.get_running_loop().create_task(self._run())

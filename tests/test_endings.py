@@ -275,56 +275,53 @@ MDEFS = (MONEY, NAME)
 
 
 def test_money_slot_keeps_the_words_and_adds_amount_and_currency() -> None:
-    slots, rejected = merge_slots(
-        MDEFS,
-        empty_slots(MDEFS),
-        {"monthly_bill": "over five hundred shekels per month", "monthly_bill_amount": 500, "monthly_bill_currency": "ILS", "name": None},
-    )
+    slots, rejected = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "over five hundred shekels per month", "name": None})
     assert rejected == []
     assert slots["monthly_bill"] == {"text": "over five hundred shekels per month", "amount": 500, "currency": "ILS"}
 
 
 def test_money_slot_assumes_the_profile_currency_when_none_was_named() -> None:
-    slots, _ = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "about 450.50", "monthly_bill_amount": 450.5, "monthly_bill_currency": None})
+    slots, _ = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "about 450.50"})
     assert slots["monthly_bill"] == {"text": "about 450.50", "amount": 450.5, "currency": "ILS"}
-    slots, _ = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "150 dollars", "monthly_bill_amount": "150", "monthly_bill_currency": "usd"})
+    slots, _ = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "150 dollars"})
     assert slots["monthly_bill"] == {"text": "150 dollars", "amount": 150, "currency": "USD"}
 
 
 def test_money_slot_without_a_usable_number_keeps_the_raw_text() -> None:
-    slots, rejected = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "quite a lot", "monthly_bill_amount": None, "monthly_bill_currency": None})
-    assert slots["monthly_bill"] == {"text": "quite a lot", "amount": None, "currency": None} and rejected == []
-    for bad in (0, -20, True, "lots", float("nan")):
-        slots, _ = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "hmm", "monthly_bill_amount": bad})
-        assert slots["monthly_bill"]["amount"] is None and slots["monthly_bill"]["currency"] is None
+    for words in ("quite a lot", "between 400 and 500 shekels"):  # no number, or two different ones: never guess
+        slots, rejected = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": words})
+        assert slots["monthly_bill"] == {"text": words, "amount": None, "currency": None} and rejected == []
 
 
 def test_money_slot_unknown_stays_empty_and_null_never_erases() -> None:
-    empty, rejected = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": None, "monthly_bill_amount": None, "monthly_bill_currency": None})
+    empty, rejected = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": None})
     assert empty["monthly_bill"] is None and rejected == []
+    assert merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill": "unknown"})[0]["monthly_bill"] is None
     known = {"monthly_bill": {"text": "500 shekels", "amount": 500, "currency": "ILS"}, "name": None}
     assert merge_slots(MDEFS, known, {"monthly_bill": None})[0] == known
-    # the model repeats the words later but forgets the number: keep what we understood
-    assert merge_slots(MDEFS, known, {"monthly_bill": "500 shekels", "monthly_bill_amount": None})[0] == known
-    # a correction replaces it
-    fixed, _ = merge_slots(MDEFS, known, {"monthly_bill": "sorry, 700", "monthly_bill_amount": 700})
+    assert merge_slots(MDEFS, known, {"monthly_bill": "500 shekels"})[0] == known  # the model repeats it every turn
+    fixed, _ = merge_slots(MDEFS, known, {"monthly_bill": "sorry, 700"})  # a correction replaces it
     assert fixed["monthly_bill"] == {"text": "sorry, 700", "amount": 700, "currency": "ILS"}
-    # only a number: the text is made from it
-    only, _ = merge_slots(MDEFS, empty_slots(MDEFS), {"monthly_bill_amount": 300, "monthly_bill": None})
-    assert only["monthly_bill"] == {"text": "300 ILS", "amount": 300, "currency": "ILS"}
 
 
-def test_money_slot_schema_prompt_and_log_line() -> None:
+def test_money_slot_is_one_plain_text_field_for_the_model() -> None:
+    """Regression: three reply fields per money slot made the model stop answering in JSON."""
     schema = reply_schema(MDEFS)["properties"]["slots"]
-    assert schema["required"] == ["monthly_bill", "monthly_bill_amount", "monthly_bill_currency", "name"]
-    assert schema["properties"]["monthly_bill_amount"] == {"type": ["number", "null"]}
+    assert schema["required"] == ["monthly_bill", "name"]
+    assert schema["properties"]["monthly_bill"] == {"type": ["string", "null"]}
     prompt = build_system_prompt(dataclasses.replace(PROFILE, slots=MDEFS))
-    assert "- monthly_bill_amount:" in prompt and "shekels or NIS = ILS" in prompt
+    assert "- monthly_bill: short text, the amount as the caller said it" in prompt
+    assert "monthly_bill_amount" not in prompt and "monthly_bill_currency" not in prompt
+    stored = {"monthly_bill": {"text": "five hundred shekels", "amount": 500, "currency": "ILS"}, "name": None}
+    directive = build_directive(make_plan(MDEFS, stored, None), stored)
+    assert 'Known so far: {"monthly_bill": "five hundred shekels"}' in directive  # the model only sees the words
+
+
+def test_money_slot_log_line() -> None:
     assert display_value({"text": "five hundred shekels", "amount": 500, "currency": "ILS"}) == '500 ILS ("five hundred shekels")'
     assert display_value({"text": "a lot", "amount": None, "currency": None}) == '"a lot" (amount not understood)'
     line = format_record({"type": "state", "slots": {"monthly_bill": {"text": "x", "amount": 5, "currency": "ILS"}, "name": None}, "phase": "collect"})
     assert line is not None and 'monthly_bill=5 ILS ("x")' in line
-    assert "ILS" in build_directive(make_plan(MDEFS, {"monthly_bill": {"text": "x", "amount": 5, "currency": "ILS"}, "name": None}, None), {"monthly_bill": {"text": "x", "amount": 5, "currency": "ILS"}})
 
 
 def test_money_slot_validation() -> None:
@@ -333,8 +330,6 @@ def test_money_slot_validation() -> None:
     assert any("needs 'currency'" in p for p in parse_slots([{**ok, "currency": "shekels"}])[1])
     assert any("needs 'currency'" in p for p in parse_slots([{k: v for k, v in ok.items() if k != "currency"}])[1])
     assert any("only allowed for type 'money'" in p for p in parse_slots([{**ok, "type": "text"}])[1])
-    clash = parse_slots([ok, {"name": "bill_amount", "type": "number", "question": "Number?"}])[1]
-    assert any("clashes with a field of the money slot" in p for p in clash)
 
 
 # ====================================================================== hang-up wait

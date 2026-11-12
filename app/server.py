@@ -5,8 +5,9 @@ the call UUID, then streams caller audio in 20 ms frames.
 
 Modes, chosen at start-up from ``.env``:
 
-* **agent** (phase 2b, default when both API keys are set): Flux speech-to-text
-  -> Groq LLM -> Aura text-to-speech; the bot greets and converses.
+* **agent** (default when both API keys are set): speech-to-text -> Groq LLM
+  -> text-to-speech; the bot greets and converses. Which speech services are
+  used comes from the profile (see ``app/providers.py``; Flux + Aura by default).
 * **stt** (phase 2a fallback): live transcription only, caller hears silence.
 * ``ECHO_MODE=true`` additionally plays the caller's audio back (debugging).
 
@@ -39,12 +40,14 @@ from .audiosocket import (
 from .call_log import CallRecorder, format_record
 from .config import Settings, load_settings
 from .llm_groq import GroqLLM
+from .phrase_cache import PhraseCache
 from .profiles import Profile, ProfileError, load_profile
 from .prompt_builder import build_system_prompt
+from . import rtp_stats
 from .recording import RETENTION_DAYS, InboundRecorder, cleanup_old_recordings
+from .providers import check_providers, make_stt, make_tts
+from .speech import SpeechEvent, STTProvider, TTSProvider
 from .stt_deepgram import AudioClock, DeepgramParams, DeepgramStream, SttEvent, TranscriptTracker
-from .stt_flux import FluxEvent, FluxParams, FluxStream
-from .tts_aura import AuraTTS, PhraseCache
 from .vad import BargeInDetector
 
 log = logging.getLogger("voice_agent")
@@ -53,8 +56,30 @@ READ_CHUNK = 4096
 #: Exit code for "configuration is wrong"; systemd is told not to restart on it.
 EXIT_CONFIG = 78
 #: Deepgram drops idle HTTPS connections after ~5 s; stay comfortably below that.
+#: Only TTS providers that name a `keep_warm_url` are touched.
 KEEP_WARM_INTERVAL_S = 3.0
 GROQ_WARM_EVERY = 6  # every 6th tick = every 18 s
+
+
+#: Tasks that outlive their call (collecting Asterisk's RTP statistics after hang-up).
+_after_call: set["asyncio.Task[None]"] = set()
+
+
+async def record_rtp_stats(settings: Settings, call_id: str, started_wall: float, tag: str) -> None:
+    """After hang-up: add Asterisk's network statistics for the call to its log. Never raises."""
+    try:
+        stats = await rtp_stats.collect(settings.rtp_stats_dir, call_id)
+        if not stats:
+            return
+        record = {"type": "rtp_stats", **stats}
+        recorder = CallRecorder(settings.calls_dir, call_id, started_wall)
+        recorder.write(record)
+        recorder.close()
+        line = format_record(record)
+        if line:
+            log.info("[%s] %s", tag, line)
+    except Exception:
+        log.exception("could not record RTP statistics")
 
 
 @dataclass
@@ -66,7 +91,7 @@ class Services:
     system_prompt: str = ""
     http: Optional[httpx.AsyncClient] = None
     llm: Optional[GroqLLM] = None
-    tts: Optional[AuraTTS] = None
+    tts: Optional[TTSProvider] = None
     phrases: Optional[PhraseCache] = None
 
     async def keep_warm(self) -> None:
@@ -74,7 +99,8 @@ class Services:
 
         A cold HTTPS connection costs 200-300 ms of handshakes, which would land
         on the caller's wait for a reply. Deepgram closes a connection after
-        about 5 s without traffic (measured), so we touch it every few seconds;
+        about 5 s without traffic (measured), so we touch it every few seconds
+        (the TTS provider says which URL, or None for "do not ping");
         Groq keeps connections much longer, so it is touched less often. These
         requests carry no credentials and their response is irrelevant - only
         the open connection matters.
@@ -83,7 +109,8 @@ class Services:
             return
         tick = 0
         while True:
-            urls = ["https://api.deepgram.com/"]
+            tts_url = self.tts.keep_warm_url if self.tts is not None else None
+            urls = [tts_url] if tts_url else []
             if tick % GROQ_WARM_EVERY == 0:
                 urls.append("https://api.groq.com/")
             for url in urls:
@@ -115,13 +142,15 @@ def build_services(settings: Settings) -> Services:
     if not settings.agent_active:
         return services
     services.profile = load_profile(settings.active_profile, settings.profiles_dir)
+    check_providers(services.profile)
     services.system_prompt = build_system_prompt(services.profile)
     services.http = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
         limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120.0),
     )
     services.llm = GroqLLM(services.http, settings.groq_api_key, settings.groq_model)
-    services.tts = AuraTTS(services.http, settings.deepgram_api_key, settings.aura_model)
+    services.llm.fallback_language = services.profile.language
+    services.tts = make_tts(services.profile, settings, services.http)
     services.phrases = PhraseCache(services.tts, settings.tts_cache_dir)
     return services
 
@@ -194,7 +223,7 @@ class CallSession:
         self._tracker = TranscriptTracker(self._clock)
         self._stt: Optional[DeepgramStream] = None
         # phase 2b (conversational agent)
-        self._flux: Optional[FluxStream] = None
+        self._agent_stt: Optional[STTProvider] = None
         self._agent: Optional[Agent] = None
         self._agent_start: Optional[asyncio.Task[None]] = None
         self._prewarm: Optional[asyncio.Task[None]] = None
@@ -214,6 +243,12 @@ class CallSession:
             self._cancel_pending()
             await self._shutdown_call()
             self._finish(self._end_reason or reason)
+            if self.stats.call_uuid is not None:
+                task = self._loop.create_task(
+                    record_rtp_stats(self._settings, str(self.stats.call_uuid), self.stats.started_wall, self._tag)
+                )
+                _after_call.add(task)
+                task.add_done_callback(_after_call.discard)
 
     async def _shutdown_call(self) -> None:
         try:
@@ -224,7 +259,7 @@ class CallSession:
             if self._agent is not None:
                 await self._agent.close()
             await self._close()
-            for stream in (self._flux, self._stt):
+            for stream in (self._agent_stt, self._stt):
                 if stream is not None:
                     await stream.close()  # flush: last results arrive here
             if self._audio_recorder is not None:
@@ -276,6 +311,8 @@ class CallSession:
                 )
             except Exception as exc:  # missing/broken webrtcvad must not break calls
                 log.error("[%s] local voice detection unavailable (%s); barge-in relies on STT only", self._tag, exc)
+        # The agent is created first because the speech-to-text stream reports to it.
+        stt = make_stt(services.profile, s, self._on_speech_event, self._clock)
         self._agent = Agent(
             profile=services.profile,
             system_prompt=services.system_prompt,
@@ -286,22 +323,15 @@ class CallSession:
             clock=self._clock,
             record=self._log_record,
             hangup=self._agent_hangup,
-            eager=s.flux_eager_eot_threshold > 0,
+            eager=stt.supports_eager,
             eager_allowed=lambda: llm.budget.allows_eager(s.groq_eager_min_budget),
             detector=detector,
             barge_confirm_s=s.barge_confirm_ms / 1000.0,
             end_silence_s=s.end_silence_ms / 1000.0,
             end_silence_max_s=s.end_silence_max_ms / 1000.0,
         )
-        params = FluxParams(
-            model=s.flux_model,
-            eot_threshold=s.flux_eot_threshold,
-            eager_eot_threshold=s.flux_eager_eot_threshold,
-            eot_timeout_ms=s.flux_eot_timeout_ms,
-            keyterms=services.profile.keyterms,
-        )
-        self._flux = FluxStream(s.deepgram_api_key, params, self._on_flux_event, self._clock)
-        self._flux.start()
+        self._agent_stt = stt
+        stt.start()
         self._prewarm = self._loop.create_task(services.keep_warm())
         self._agent_start = self._loop.create_task(self._agent.start())
 
@@ -319,11 +349,11 @@ class CallSession:
         if self._agent is not None:
             a = self._agent.summary()
             summary.update(a)
-            summary["stt_failed"] = bool(self._flux and self._flux.failed)
+            summary["stt_failed"] = bool(self._agent_stt and self._agent_stt.failed)
             self._record(summary)
             log.info(
                 "call ended uuid=%s duration=%.2fs turns=%d total_ms_avg=%s total_ms_max=%s barge_ins=%d "
-                "false_pauses=%d outcome=%s replans=%d stt_audio_s=%.2f llm_tokens=%d llm_cached=%d eager_skipped=%d tts_chars=%d errors=%d "
+                "false_pauses=%d outcome=%s replans=%d llm_paths=%s stt_audio_s=%.2f llm_tokens=%d llm_cached=%d eager_skipped=%d tts_chars=%d errors=%d "
                 "frames_in=%d frames_out=%d reason=%s",
                 s.call_uuid or "unknown",
                 s.duration_s(),
@@ -334,6 +364,7 @@ class CallSession:
                 a["false_pauses"],
                 a["outcome"] or "none",
                 a["replans"],
+                "/".join(f"{name}:{count}" for name, count in a["llm_paths"].items()),
                 self._clock.total_seconds,
                 a["llm_tokens"],
                 a["llm_cached_tokens"],
@@ -396,8 +427,8 @@ class CallSession:
                 self._audio_recorder.write(frame.payload)
             if self._agent is not None:
                 self._agent.on_caller_audio(frame.payload)
-            if self._flux is not None:
-                self._flux.send_audio(frame.payload, wall)
+            if self._agent_stt is not None:
+                self._agent_stt.send_audio(frame.payload, wall)
             elif self._stt is not None:
                 self._stt.send_audio(frame.payload, wall)
             if self._settings.echo_mode:
@@ -420,7 +451,7 @@ class CallSession:
         return None
 
     # ------------------------------------------------------------------ agent plumbing
-    def _on_flux_event(self, event: FluxEvent, arrival_wall: float) -> None:
+    def _on_speech_event(self, event: SpeechEvent, arrival_wall: float) -> None:
         if self._agent is not None:
             self._agent.on_stt_event(event, arrival_wall)
 
@@ -512,9 +543,9 @@ async def serve(services: Services) -> None:
             bound,
             services.mode,
             services.profile.name,
-            settings.flux_model,
+            services.profile.stt.model or settings.flux_model,
             settings.groq_model,
-            settings.aura_model,
+            services.tts.voice if services.tts is not None else "-",
             "on" if settings.flux_eager_eot_threshold > 0 else "off",
             len(services.profile.keyterms),
             "on" if settings.barge_vad_enabled else "off",
@@ -525,6 +556,7 @@ async def serve(services: Services) -> None:
         log.info("AudioSocket server listening on %s (mode=%s model=%s)", bound, services.mode, settings.deepgram_model)
 
     cleanup_old_recordings(settings.recordings_dir)
+    rtp_stats.cleanup_stale(settings.rtp_stats_dir)
     if settings.debug_record_audio:
         log.warning(
             "DEBUG_RECORD_AUDIO is ON: caller audio of every call is saved to %s and deleted after %d days. "
