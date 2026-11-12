@@ -1,10 +1,14 @@
 """AudioSocket TCP server (asyncio).
 
 Asterisk opens one TCP connection per call (dialplan ``AudioSocket()``), sends
-the call UUID, then streams caller audio in 20 ms frames. Each frame is
-forwarded to Deepgram for live transcription; transcripts are logged and saved
-per call. Nothing is sent back, so the caller hears silence - unless
-``ECHO_MODE=true``, which plays their own audio back after a delay (debugging).
+the call UUID, then streams caller audio in 20 ms frames.
+
+Modes, chosen at start-up from ``.env``:
+
+* **agent** (phase 2b, default when both API keys are set): Flux speech-to-text
+  -> Groq LLM -> Aura text-to-speech; the bot greets and converses.
+* **stt** (phase 2a fallback): live transcription only, caller hears silence.
+* ``ECHO_MODE=true`` additionally plays the caller's audio back (debugging).
 
 Run with ``python -m app.server`` from the project root.
 """
@@ -14,11 +18,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import httpx
+
+from .agent import Agent, fixed_phrases
+from .audio_out import Pacer
 from .audiosocket import (
     Frame,
     FrameParser,
@@ -29,11 +38,92 @@ from .audiosocket import (
 )
 from .call_log import CallRecorder, format_record
 from .config import Settings, load_settings
+from .llm_groq import GroqLLM
+from .profiles import Profile, ProfileError, load_profile
+from .prompt_builder import build_system_prompt
+from .recording import RETENTION_DAYS, InboundRecorder, cleanup_old_recordings
 from .stt_deepgram import AudioClock, DeepgramParams, DeepgramStream, SttEvent, TranscriptTracker
+from .stt_flux import FluxEvent, FluxParams, FluxStream
+from .tts_aura import AuraTTS, PhraseCache
+from .vad import BargeInDetector
 
 log = logging.getLogger("voice_agent")
 
 READ_CHUNK = 4096
+#: Exit code for "configuration is wrong"; systemd is told not to restart on it.
+EXIT_CONFIG = 78
+#: Deepgram drops idle HTTPS connections after ~5 s; stay comfortably below that.
+KEEP_WARM_INTERVAL_S = 3.0
+GROQ_WARM_EVERY = 6  # every 6th tick = every 18 s
+
+
+@dataclass
+class Services:
+    """Things shared by all calls, built once at start-up."""
+
+    settings: Settings
+    profile: Optional[Profile] = None
+    system_prompt: str = ""
+    http: Optional[httpx.AsyncClient] = None
+    llm: Optional[GroqLLM] = None
+    tts: Optional[AuraTTS] = None
+    phrases: Optional[PhraseCache] = None
+
+    async def keep_warm(self) -> None:
+        """Keep TLS connections to the LLM and TTS hosts open while a call is active.
+
+        A cold HTTPS connection costs 200-300 ms of handshakes, which would land
+        on the caller's wait for a reply. Deepgram closes a connection after
+        about 5 s without traffic (measured), so we touch it every few seconds;
+        Groq keeps connections much longer, so it is touched less often. These
+        requests carry no credentials and their response is irrelevant - only
+        the open connection matters.
+        """
+        if self.http is None:
+            return
+        tick = 0
+        while True:
+            urls = ["https://api.deepgram.com/"]
+            if tick % GROQ_WARM_EVERY == 0:
+                urls.append("https://api.groq.com/")
+            for url in urls:
+                try:
+                    await self.http.get(url, timeout=3.0)
+                except httpx.HTTPError:
+                    pass
+            tick += 1
+            await asyncio.sleep(KEEP_WARM_INTERVAL_S)
+
+    @property
+    def agent_ready(self) -> bool:
+        return self.profile is not None and self.llm is not None and self.phrases is not None
+
+    @property
+    def mode(self) -> str:
+        if self.agent_ready:
+            mode = "agent"
+        elif self.settings.stt_active:
+            mode = "stt"
+        else:
+            mode = "no-stt"
+        return mode + ("+echo" if self.settings.echo_mode else "")
+
+
+def build_services(settings: Settings) -> Services:
+    """Create shared clients. Raises :class:`ProfileError` for a bad profile."""
+    services = Services(settings)
+    if not settings.agent_active:
+        return services
+    services.profile = load_profile(settings.active_profile, settings.profiles_dir)
+    services.system_prompt = build_system_prompt(services.profile)
+    services.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
+        limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120.0),
+    )
+    services.llm = GroqLLM(services.http, settings.groq_api_key, settings.groq_model)
+    services.tts = AuraTTS(services.http, settings.deepgram_api_key, settings.aura_model)
+    services.phrases = PhraseCache(services.tts, settings.tts_cache_dir)
+    return services
 
 
 @dataclass
@@ -87,11 +177,12 @@ class CallSession:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-        settings: Settings,
+        services: Services,
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self._settings = settings
+        self._services = services
+        self._settings = services.settings
         self._parser = FrameParser()
         self._loop = asyncio.get_running_loop()
         self._pending: set[asyncio.TimerHandle] = set()
@@ -99,8 +190,16 @@ class CallSession:
         self._tag = "--------"
         self._recorder: Optional[CallRecorder] = None
         self._clock = AudioClock()
+        # phase 2a (transcription only)
         self._tracker = TranscriptTracker(self._clock)
         self._stt: Optional[DeepgramStream] = None
+        # phase 2b (conversational agent)
+        self._flux: Optional[FluxStream] = None
+        self._agent: Optional[Agent] = None
+        self._agent_start: Optional[asyncio.Task[None]] = None
+        self._prewarm: Optional[asyncio.Task[None]] = None
+        self._end_reason: Optional[str] = None
+        self._audio_recorder: Optional[InboundRecorder] = None
 
     async def run(self) -> None:
         reason = "eof"
@@ -113,26 +212,46 @@ class CallSession:
             raise
         finally:
             self._cancel_pending()
+            await self._shutdown_call()
+            self._finish(self._end_reason or reason)
+
+    async def _shutdown_call(self) -> None:
+        try:
+            for task in (self._agent_start, self._prewarm):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            if self._agent is not None:
+                await self._agent.close()
             await self._close()
-            if self._stt is not None:
-                try:
-                    await self._stt.close()  # flush: last finals arrive here
-                except asyncio.CancelledError:
-                    pass
-            self._finish(reason)
+            for stream in (self._flux, self._stt):
+                if stream is not None:
+                    await stream.close()  # flush: last results arrive here
+            if self._audio_recorder is not None:
+                self._audio_recorder.close()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("[%s] error while closing the call", self._tag)
 
     # ------------------------------------------------------------------ call start / end
     def _start_call(self, call_uuid: uuid.UUID) -> None:
         self.stats.call_uuid = call_uuid
         self._tag = str(call_uuid)[:8]
-        s = self._settings
+        s, services = self._settings, self._services
         self._recorder = CallRecorder(s.calls_dir, str(call_uuid), self.stats.started_wall)
-        mode = "stt" if s.stt_active else "no-stt"
-        if s.echo_mode:
-            mode += "+echo"
-        log.info("call started uuid=%s mode=%s", call_uuid, mode)
-        self._record({"type": "call_start", "uuid": str(call_uuid), "mode": mode})
-        if s.stt_active:
+        profile = services.profile.name if services.profile and services.agent_ready else None
+        log.info("call started uuid=%s mode=%s%s", call_uuid, services.mode, f" profile={profile}" if profile else "")
+        self._record({"type": "call_start", "uuid": str(call_uuid), "mode": services.mode, "profile": profile})
+        # Old debug recordings are removed whether or not recording is on right now.
+        cleanup_old_recordings(s.recordings_dir)
+        if s.debug_record_audio:
+            self._audio_recorder = InboundRecorder(s.recordings_dir, str(call_uuid))
+            log.warning("[%s] DEBUG_RECORD_AUDIO is on: caller audio is being recorded (kept %d days)", self._tag, RETENTION_DAYS)
+
+        if services.agent_ready:
+            self._start_agent()
+        elif s.stt_active:
             params = DeepgramParams(
                 model=s.deepgram_model,
                 language=s.deepgram_language,
@@ -144,8 +263,50 @@ class CallSession:
         elif s.stt_enabled:
             log.warning("[%s] DEEPGRAM_API_KEY is not set - transcription is off", self._tag)
 
+    def _start_agent(self) -> None:
+        s, services = self._settings, self._services
+        assert services.profile and services.llm and services.tts and services.phrases
+        pacer = Pacer(self._send_audio_frame, on_frame=self._on_frame_sent)
+        llm = services.llm
+        detector: Optional[BargeInDetector] = None
+        if s.barge_vad_enabled:
+            try:
+                detector = BargeInDetector(
+                    mode=s.barge_vad_mode, min_rms=s.barge_min_rms, min_speech_ms=s.barge_min_speech_ms
+                )
+            except Exception as exc:  # missing/broken webrtcvad must not break calls
+                log.error("[%s] local voice detection unavailable (%s); barge-in relies on STT only", self._tag, exc)
+        self._agent = Agent(
+            profile=services.profile,
+            system_prompt=services.system_prompt,
+            llm=services.llm,
+            tts=services.tts,
+            phrases=services.phrases,
+            pacer=pacer,
+            clock=self._clock,
+            record=self._log_record,
+            hangup=self._agent_hangup,
+            eager=s.flux_eager_eot_threshold > 0,
+            eager_allowed=lambda: llm.budget.allows_eager(s.groq_eager_min_budget),
+            detector=detector,
+            barge_confirm_s=s.barge_confirm_ms / 1000.0,
+            end_silence_s=s.end_silence_ms / 1000.0,
+            end_silence_max_s=s.end_silence_max_ms / 1000.0,
+        )
+        params = FluxParams(
+            model=s.flux_model,
+            eot_threshold=s.flux_eot_threshold,
+            eager_eot_threshold=s.flux_eager_eot_threshold,
+            eot_timeout_ms=s.flux_eot_timeout_ms,
+            keyterms=services.profile.keyterms,
+        )
+        self._flux = FluxStream(s.deepgram_api_key, params, self._on_flux_event, self._clock)
+        self._flux.start()
+        self._prewarm = self._loop.create_task(services.keep_warm())
+        self._agent_start = self._loop.create_task(self._agent.start())
+
     def _finish(self, reason: str) -> None:
-        s, t = self.stats, self._tracker
+        s = self.stats
         summary: dict[str, Any] = {
             "type": "call_end",
             "reason": reason,
@@ -153,32 +314,65 @@ class CallSession:
             "frames_in": s.frames_in,
             "frames_out": s.frames_out,
             "avg_jitter_ms": round(s.avg_jitter_ms, 2),
-            "finals": t.finals,
-            "stt_latency_avg_ms": None if t.avg_latency_ms is None else round(t.avg_latency_ms, 1),
-            "stt_latency_max_ms": None if t.max_latency_ms is None else round(t.max_latency_ms, 1),
-            "audio_sent_s": round(self._clock.total_seconds, 2),
-            "deepgram_reported_s": t.deepgram_duration,
-            "deepgram_request_id": t.request_id or None,
-            "stt_failed": bool(self._stt and self._stt.failed),
-            "stt_dropped_frames": self._stt.dropped_frames if self._stt else 0,
+            "stt_audio_s": round(self._clock.total_seconds, 2),
         }
-        self._record(summary)
+        if self._agent is not None:
+            a = self._agent.summary()
+            summary.update(a)
+            summary["stt_failed"] = bool(self._flux and self._flux.failed)
+            self._record(summary)
+            log.info(
+                "call ended uuid=%s duration=%.2fs turns=%d total_ms_avg=%s total_ms_max=%s barge_ins=%d "
+                "false_pauses=%d outcome=%s replans=%d stt_audio_s=%.2f llm_tokens=%d llm_cached=%d eager_skipped=%d tts_chars=%d errors=%d "
+                "frames_in=%d frames_out=%d reason=%s",
+                s.call_uuid or "unknown",
+                s.duration_s(),
+                a["turns"],
+                _ms(a["total_ms_avg"]),
+                _ms(a["total_ms_max"]),
+                a["barge_ins"],
+                a["false_pauses"],
+                a["outcome"] or "none",
+                a["replans"],
+                self._clock.total_seconds,
+                a["llm_tokens"],
+                a["llm_cached_tokens"],
+                a["eager_skipped"],
+                a["tts_chars"],
+                a["errors"],
+                s.frames_in,
+                s.frames_out,
+                reason,
+            )
+        else:
+            t = self._tracker
+            summary.update(
+                {
+                    "finals": t.finals,
+                    "stt_latency_avg_ms": None if t.avg_latency_ms is None else round(t.avg_latency_ms, 1),
+                    "stt_latency_max_ms": None if t.max_latency_ms is None else round(t.max_latency_ms, 1),
+                    "deepgram_reported_s": t.deepgram_duration,
+                    "deepgram_request_id": t.request_id or None,
+                    "stt_failed": bool(self._stt and self._stt.failed),
+                }
+            )
+            self._record(summary)
+            log.info(
+                "call ended uuid=%s duration=%.2fs finals=%d stt_latency_avg_ms=%s stt_latency_max_ms=%s "
+                "audio_sent_s=%.2f frames_in=%d frames_out=%d avg_jitter_ms=%.2f reason=%s",
+                s.call_uuid or "unknown",
+                s.duration_s(),
+                t.finals,
+                _ms(t.avg_latency_ms),
+                _ms(t.max_latency_ms),
+                self._clock.total_seconds,
+                s.frames_in,
+                s.frames_out,
+                s.avg_jitter_ms,
+                reason,
+            )
         if self._recorder is not None:
             self._recorder.close()
-        log.info(
-            "call ended uuid=%s duration=%.2fs finals=%d stt_latency_avg_ms=%s stt_latency_max_ms=%s "
-            "audio_sent_s=%.2f frames_in=%d frames_out=%d avg_jitter_ms=%.2f reason=%s",
-            s.call_uuid or "unknown",
-            s.duration_s(),
-            t.finals,
-            _ms(t.avg_latency_ms),
-            _ms(t.max_latency_ms),
-            self._clock.total_seconds,
-            s.frames_in,
-            s.frames_out,
-            s.avg_jitter_ms,
-            reason,
-        )
 
     # ------------------------------------------------------------------ inbound frames
     async def _read_loop(self) -> str:
@@ -198,7 +392,13 @@ class CallSession:
         kind = frame.kind
         if kind is FrameType.AUDIO:
             self.stats.audio_in(frame.payload, now)
-            if self._stt is not None:
+            if self._audio_recorder is not None:
+                self._audio_recorder.write(frame.payload)
+            if self._agent is not None:
+                self._agent.on_caller_audio(frame.payload)
+            if self._flux is not None:
+                self._flux.send_audio(frame.payload, wall)
+            elif self._stt is not None:
                 self._stt.send_audio(frame.payload, wall)
             if self._settings.echo_mode:
                 self._echo_later(frame.payload)
@@ -219,7 +419,39 @@ class CallSession:
         log.debug("ignoring unknown frame type 0x%02x (%d bytes)", frame.type, len(frame.payload))
         return None
 
-    # ------------------------------------------------------------------ transcription
+    # ------------------------------------------------------------------ agent plumbing
+    def _on_flux_event(self, event: FluxEvent, arrival_wall: float) -> None:
+        if self._agent is not None:
+            self._agent.on_stt_event(event, arrival_wall)
+
+    def _send_audio_frame(self, frame: bytes) -> None:
+        if not self._writer.is_closing():
+            self._writer.write(encode_frame(FrameType.AUDIO, frame))
+            self.stats.frames_out += 1
+
+    def _on_frame_sent(self) -> None:
+        if self._agent is not None:
+            self._agent.on_frame_sent()
+
+    def _agent_hangup(self, reason: str) -> None:
+        """The agent decided the call is over: tell Asterisk to hang up."""
+        self._end_reason = reason
+        log.info("[%s] hanging up (%s)", self._tag, reason)
+        if not self._writer.is_closing():
+            self._writer.write(encode_frame(FrameType.HANGUP))
+            self._writer.close()
+
+    def _log_record(self, record: dict[str, Any]) -> None:
+        """Store a record in the call file and print its log line."""
+        try:
+            self._record(record)
+            text = format_record(record)
+            if text is not None:
+                log.info("[%s] %s", self._tag, text)
+        except Exception:
+            log.exception("[%s] failed to log a record", self._tag)
+
+    # ------------------------------------------------------------------ transcription only (phase 2a)
     def _on_stt_event(self, event: SttEvent, arrival_wall: float) -> None:
         """Called by the Deepgram stream for every message. Must never raise."""
         try:
@@ -257,49 +489,97 @@ class CallSession:
         self._pending.clear()
 
     async def _close(self) -> None:
-        self._writer.close()
+        if not self._writer.is_closing():
+            self._writer.close()
         try:
             await self._writer.wait_closed()
         except (ConnectionError, OSError):
             pass
 
 
-async def serve(settings: Settings) -> None:
+async def serve(services: Services) -> None:
     """Run the server until SIGTERM / SIGINT."""
+    settings = services.settings
 
     async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await CallSession(reader, writer, settings).run()
+        await CallSession(reader, writer, services).run()
 
     server = await asyncio.start_server(on_connect, host=settings.host, port=settings.port)
     bound = ", ".join(f"{s.getsockname()[0]}:{s.getsockname()[1]}" for s in server.sockets or ())
-    log.info(
-        "AudioSocket server listening on %s (stt=%s model=%s echo_mode=%s)",
-        bound,
-        "on" if settings.stt_active else "off",
-        settings.deepgram_model,
-        settings.echo_mode,
-    )
+    if services.agent_ready and services.profile is not None:
+        log.info(
+            "AudioSocket server listening on %s (mode=%s profile=%s stt=%s llm=%s tts=%s eager=%s keyterms=%d local_vad=%s)",
+            bound,
+            services.mode,
+            services.profile.name,
+            settings.flux_model,
+            settings.groq_model,
+            settings.aura_model,
+            "on" if settings.flux_eager_eot_threshold > 0 else "off",
+            len(services.profile.keyterms),
+            "on" if settings.barge_vad_enabled else "off",
+        )
+    else:
+        if settings.agent_enabled:
+            log.warning("agent mode is off: DEEPGRAM_API_KEY and GROQ_API_KEY are both required")
+        log.info("AudioSocket server listening on %s (mode=%s model=%s)", bound, services.mode, settings.deepgram_model)
+
+    cleanup_old_recordings(settings.recordings_dir)
+    if settings.debug_record_audio:
+        log.warning(
+            "DEBUG_RECORD_AUDIO is ON: caller audio of every call is saved to %s and deleted after %d days. "
+            "Use for test calls only.",
+            settings.recordings_dir,
+            RETENTION_DAYS,
+        )
+
+    warmup: Optional[asyncio.Task[None]] = None
+    if services.agent_ready and services.phrases is not None and services.profile is not None:
+        # Pre-generate greeting / apology / goodbye so the first call starts instantly.
+        warmup = asyncio.get_running_loop().create_task(services.phrases.warm(fixed_phrases(services.profile)))
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    async with server:
-        await stop.wait()
-        log.info("shutting down")
+    try:
+        async with server:
+            await stop.wait()
+            log.info("shutting down")
+    finally:
+        if warmup is not None:
+            warmup.cancel()
+        if services.http is not None:
+            await services.http.aclose()
 
 
 def main() -> None:
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_CONFIG)
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     # At DEBUG the websockets library logs handshake headers, which would
-    # include the Authorization header. Never let it go below INFO.
+    # include the Authorization header. Never let it go below INFO. httpx logs
+    # one line per request at INFO; keep that out of the call log too.
     logging.getLogger("websockets").setLevel(logging.INFO)
-    asyncio.run(serve(settings))
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    async def run() -> None:
+        try:
+            services = build_services(settings)
+        except ProfileError as exc:
+            log.error("cannot start: %s", exc)
+            raise SystemExit(EXIT_CONFIG) from None
+        await serve(services)
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

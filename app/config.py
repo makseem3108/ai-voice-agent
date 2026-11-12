@@ -37,8 +37,41 @@ class Settings:
     deepgram_endpointing_ms: int = 400
     deepgram_utterance_end_ms: int = 1000
 
+    #: Conversational agent (phase 2b). Needs both API keys; otherwise the
+    #: server falls back to transcription only (phase 2a behaviour).
+    agent_enabled: bool = True
+    active_profile: str = "lead_qualification"
+    profiles_dir: Path = PROJECT_ROOT / "profiles"
+    groq_api_key: str = field(default="", repr=False)
+    groq_model: str = "openai/gpt-oss-120b"
+    #: Eager head starts are skipped while less than this share of the
+    #: per-minute token allowance is left (0 = never skip).
+    groq_eager_min_budget: float = 0.4
+    aura_model: str = "aura-2-thalia-en"
+    flux_model: str = "flux-general-en"
+    flux_eot_threshold: float = 0.7
+    #: 0 switches the eager head start off (fewer LLM requests, slightly slower replies).
+    flux_eager_eot_threshold: float = 0.5
+    flux_eot_timeout_ms: int = 3000
+
+    #: Fast barge-in: local voice detection pauses the bot before STT confirms.
+    barge_vad_enabled: bool = True
+    barge_vad_mode: int = 3  # WebRTC VAD aggressiveness, 3 = strictest
+    barge_min_rms: int = 500  # loudness gate that keeps the bot's own echo out
+    barge_min_speech_ms: int = 120
+    barge_confirm_ms: int = 2500  # resume if STT has not confirmed by then
+    #: Silence to wait after the closing line before hanging up.
+    end_silence_ms: int = 1500
+    end_silence_max_ms: int = 3000  # sound on the line can stretch the wait, never past this
+
+    #: Debug only: save the caller's audio per call. Files are deleted after 7 days.
+    debug_record_audio: bool = False
+    recordings_dir: Path = PROJECT_ROOT / "data" / "recordings"
+
     #: Where per-call JSONL transcripts are written.
     calls_dir: Path = PROJECT_ROOT / "data" / "calls"
+    #: Cached audio for fixed phrases (greeting, apology, goodbye).
+    tts_cache_dir: Path = PROJECT_ROOT / "data" / "tts_cache"
 
     @property
     def echo_delay_s(self) -> float:
@@ -47,6 +80,10 @@ class Settings:
     @property
     def stt_active(self) -> bool:
         return self.stt_enabled and bool(self.deepgram_api_key)
+
+    @property
+    def agent_active(self) -> bool:
+        return self.agent_enabled and bool(self.deepgram_api_key) and bool(self.groq_api_key)
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -76,6 +113,19 @@ def _int(values: Mapping[str, str], key: str, default: int, lo: int, hi: int) ->
         number = int(raw)
     except ValueError:
         raise ValueError(f"{key} must be an integer, got {raw!r}") from None
+    if not lo <= number <= hi:
+        raise ValueError(f"{key} must be between {lo} and {hi}, got {number}")
+    return number
+
+
+def _float(values: Mapping[str, str], key: str, default: float, lo: float, hi: float) -> float:
+    raw = values.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        number = float(raw)
+    except ValueError:
+        raise ValueError(f"{key} must be a number, got {raw!r}") from None
     if not lo <= number <= hi:
         raise ValueError(f"{key} must be between {lo} and {hi}, got {number}")
     return number
@@ -111,5 +161,26 @@ def load_settings(
         deepgram_language=values.get("DEEPGRAM_LANGUAGE") or "en",
         deepgram_endpointing_ms=_int(values, "DEEPGRAM_ENDPOINTING_MS", 400, 10, 5000),
         deepgram_utterance_end_ms=_int(values, "DEEPGRAM_UTTERANCE_END_MS", 1000, 1000, 5000),
+        agent_enabled=_bool(values, "AGENT_ENABLED", True),
+        active_profile=(values.get("ACTIVE_PROFILE") or "lead_qualification").strip(),
+        profiles_dir=Path(values["PROFILES_DIR"]) if values.get("PROFILES_DIR") else PROJECT_ROOT / "profiles",
+        groq_api_key=(values.get("GROQ_API_KEY") or "").strip(),
+        groq_model=values.get("GROQ_MODEL") or "openai/gpt-oss-120b",
+        groq_eager_min_budget=_float(values, "GROQ_EAGER_MIN_BUDGET", 0.4, 0.0, 1.0),
+        aura_model=values.get("AURA_MODEL") or "aura-2-thalia-en",
+        flux_model=values.get("FLUX_MODEL") or "flux-general-en",
+        flux_eot_threshold=_float(values, "FLUX_EOT_THRESHOLD", 0.7, 0.5, 1.0),
+        flux_eager_eot_threshold=_float(values, "FLUX_EAGER_EOT_THRESHOLD", 0.5, 0.0, 0.9),
+        flux_eot_timeout_ms=_int(values, "FLUX_EOT_TIMEOUT_MS", 3000, 500, 60000),
+        barge_vad_enabled=_bool(values, "BARGE_VAD_ENABLED", True),
+        barge_vad_mode=_int(values, "BARGE_VAD_MODE", 3, 0, 3),
+        barge_min_rms=_int(values, "BARGE_MIN_RMS", 500, 0, 20000),
+        barge_min_speech_ms=_int(values, "BARGE_MIN_SPEECH_MS", 120, 20, 1000),
+        barge_confirm_ms=_int(values, "BARGE_CONFIRM_MS", 2500, 200, 10000),
+        end_silence_ms=_int(values, "END_SILENCE_MS", 1500, 0, 15000),
+        end_silence_max_ms=_int(values, "END_SILENCE_MAX_MS", 3000, 0, 15000),
+        debug_record_audio=_bool(values, "DEBUG_RECORD_AUDIO", False),
+        recordings_dir=Path(values["RECORDINGS_DIR"]) if values.get("RECORDINGS_DIR") else PROJECT_ROOT / "data" / "recordings",
         calls_dir=Path(calls_dir) if calls_dir else PROJECT_ROOT / "data" / "calls",
+        tts_cache_dir=Path(values["TTS_CACHE_DIR"]) if values.get("TTS_CACHE_DIR") else PROJECT_ROOT / "data" / "tts_cache",
     )

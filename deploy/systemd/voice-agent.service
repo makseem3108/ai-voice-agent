@@ -11,6 +11,7 @@ WorkingDirectory=/home/voice/voice-agent
 ExecStart=/home/voice/voice-agent/.venv/bin/python -m app.server
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=2
 MemoryMax=256M
 NoNewPrivileges=yes

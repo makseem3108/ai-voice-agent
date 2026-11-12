@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TextIO
 
+from .slots import display_value
+
 log = logging.getLogger("voice_agent.calllog")
 
 
@@ -33,6 +35,63 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
         return f"[utterance_end] last word ended at {record['last_word_end']:.2f}s"
     if kind == "speech_start":
         return f"[speech_start] at {record['audio_t']:.2f}s"
+    if kind == "user":
+        return f"[user] {record['text']}"
+    if kind == "bot":
+        note = " (interrupted)" if record.get("interrupted") else ""
+        label = f"[bot:{record['kind']}]" if record.get("kind") else "[bot] "
+        return f"{label} {record['text']}{note}"
+    if kind == "turn":
+        def ms(key: str) -> str:
+            value = record.get(key)
+            return "n/a" if value is None else f"{value:.0f}"
+
+        return (
+            f"[turn {record['turn']}] stt_ms={ms('stt_ms')} llm_first_token_ms={ms('llm_first_token_ms')} "
+            f"tts_first_audio_ms={ms('tts_first_audio_ms')} total_ms={ms('total_ms')} "
+            f"eager={'yes' if record.get('eager') else 'no'}"
+        )
+    if kind == "barge_in":
+        dropped = record.get("dropped_frames", 0)
+        paused = record.get("local_pause_ms")
+        how = "" if paused is None else f"; bot was already paused {paused:.0f} ms earlier by local voice detection"
+        return f"[barge_in] caller interrupted; dropped {dropped} queued frames ({dropped * 0.02:.1f}s of speech){how}"
+    if kind == "barge_pause":
+        return f"[barge_pause] caller voice detected locally (rms={record.get('rms', 0):.0f}); bot paused, waiting for STT to confirm"
+    if kind == "barge_resume":
+        return f"[barge_resume] STT did not confirm within {record.get('paused_ms', 0):.0f} ms; bot resumed"
+    if kind == "stt_event":
+        if record.get("event") != "StartOfTurn":
+            return None  # Update / Eager / EndOfTurn details are kept in the call file only
+        return f"[flux] StartOfTurn (audio {record.get('audio_end', 0):.2f}s, reported {record.get('lag_ms') or 0:.0f} ms after that audio arrived)"
+    if kind == "ending":
+        return f"[ending] outcome={record.get('outcome')}; hanging up after {record.get('silence_s', 0):g}s of silence unless the caller speaks"
+    if kind == "hangup_extended":
+        return (
+            f"[hangup_extended] sound on the line (rms={record.get('rms')}) {record.get('waited_ms', 0):.0f} ms after the closing line; "
+            f"hanging up in {record.get('hangup_in_ms', 0):.0f} ms" + (" (at the limit)" if record.get("capped") else "")
+        )
+    if kind == "hangup_cancelled":
+        return "[hangup_cancelled] caller spoke after the closing line; call continues"
+    if kind == "ending_blocked":
+        why = {
+            "caller_did_not_decline": "the caller's last words were not a decline or goodbye",
+            "not_fit_without_asking": "not-a-fit ending before asking if there is anything else",
+        }.get(str(record.get("reason")), str(record.get("reason")))
+        return f"[ending_blocked] model tried to end the call but {why}; staying on the line"
+    if kind == "state":
+        known = ", ".join(f"{k}={display_value(v)}" for k, v in (record.get("slots") or {}).items() if v is not None) or "none"
+        return (
+            f"[state] outcome={record.get('outcome') or 'undecided'} phase={record.get('phase')} "
+            f"next={record.get('next_slot') or '-'} slots: {known}"
+            + (" (replanned)" if record.get("replanned") else "")
+        )
+    if kind == "eager_skipped":
+        return "[eager_skipped] token budget is low; early start disabled until it recovers"
+    if kind == "error":
+        return f"[error] {record['stage']}: {record['message']}"
+    if kind == "max_duration":
+        return f"[max_duration] call reached {record['seconds']}s limit; saying goodbye"
     if kind == "stt_error":
         return f"[stt_error] {record['message']}"
     return None
