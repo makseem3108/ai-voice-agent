@@ -20,6 +20,8 @@ the bot (then the closing line simply finishes)?
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import dataclass
 from typing import Optional
 
 GOODBYE = "goodbye"
@@ -56,8 +58,76 @@ def _normalise(text: str) -> str:
     return " ".join(text.split())
 
 
-def caller_reply_kind(text: str) -> Optional[str]:
+# --------------------------------------------------------------------------- Hebrew / Arabic
+# Same four ideas as in English (goodbye, "nothing more", a bare "no", a bare
+# "thanks") plus what counts as a question or a new request. Arabic patterns
+# are written in a folded spelling (ا for أ إ آ, ه for ة, ي for ى, no tashkeel)
+# and the caller's words are folded the same way before matching.
+_AR_FOLD = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ة": "ه", "ى": "ي", "ـ": None, "؟": "?"})
+
+
+def _normalise_any(text: str) -> str:
+    """Lower-case, strip marks and punctuation, keep letters of any script."""
+    text = unicodedata.normalize("NFKC", text or "").translate(_AR_FOLD).lower()
+    text = "".join(ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^\w' ]+", " ", unicodedata.normalize("NFC", text), flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+@dataclass(frozen=True)
+class _Words:
+    goodbye: "re.Pattern[str]"
+    decline_anywhere: "re.Pattern[str]"
+    bare_no: "re.Pattern[str]"
+    thanks_only: "re.Pattern[str]"
+    question: "re.Pattern[str]"
+    new_request: "re.Pattern[str]"
+
+
+def _w(alternatives: str) -> "re.Pattern[str]":
+    return re.compile(rf"(?<!\w)({alternatives})(?!\w)")
+
+
+_HEBREW = _Words(
+    goodbye=_w("להתראות|ביי|ביי ביי|יום טוב|יום נעים|ערב טוב|לילה טוב|שבוע טוב|נדבר|אני חייב ללכת|אני חייבת ללכת|תנתק|תנתקי|לסיים את השיחה"),
+    decline_anywhere=_w("זה הכל|זה הכול|זהו|לא תודה|אין צורך|לא צריך|לא צריכה|שום דבר|שום דבר אחר|הכל טוב|הכול טוב|אני מסודר|אני מסודרת|אין לי שאלות|אין לי עוד שאלות|זה מספיק"),
+    bare_no=re.compile(r"^(לא|לא לא)(?!\w)"),
+    thanks_only=re.compile(r"^(אוקיי|אוקי|או קיי|בסדר|בסדר גמור|טוב|מעולה|סבבה|יופי|מצוין)?\s*(תודה|תודה רבה|תודה רבה לך|תודה לך)$"),
+    question=_w("מה|מתי|איפה|איזה|איזו|מי|למה|איך|כמה|האם|אפשר|יש לכם|אתם"),
+    new_request=_w("רגע|שנייה|שניה|חכה|חכי|עוד שאלה|עוד משהו|יש לי שאלה|יש לי עוד|רציתי לשאול|רציתי לדעת|תגיד|תגידי|מה עם|בעצם|אל תנתק|אל תנתקי"),
+)
+_ARABIC = _Words(
+    goodbye=_w("مع السلامه|باي|باي باي|يلا باي|يلا سلام|الله معك|الله معكم|بخاطرك|في امان الله|تصبح علي خير|تصبحي علي خير|بشوفك|لازم اروح|سكر الخط|سكري الخط"),
+    decline_anywhere=_w("لا شكرا|بس هيك|هيك بس|ما في شي|ما في اشي|مافي شي|ما في شي تاني|خلص|خلاص|ولا شي|ولا اشي|ما بدي|ما بدي شي|بكفي|هذا كل شي|هاد كل شي|لا خلص|تمام هيك"),
+    bare_no=re.compile(r"^(لا|لاء|لا لا)(?!\w)"),
+    thanks_only=re.compile(r"^(تمام|ماشي|طيب|اوكي|اوكيه|منيح|حلو|ممتاز)?\s*(شكرا|شكرا الك|شكرا كتير|شكرا جزيلا|يسلمو|يسلموا|مشكور|مشكوره|يعطيك العافيه)$"),
+    question=_w("شو|ايش|متي|ايمتي|وين|مين|ليش|كيف|قديش|اديش|كم|هل|ممكن|بقدر|فيني|في عندكم|عندكم"),
+    new_request=_w("لحظه|استني|استنا|دقيقه|ثانيه|سؤال|عندي سؤال|بدي اسال|بدي اعرف|شي تاني|اشي تاني|كمان شي|كمان اشي|طيب و|لا تسكر|لا تسكري|احكيلي|خبرني|خبريني"),
+)
+_BY_LANGUAGE = {"he": _HEBREW, "ar": _ARABIC}
+
+
+def _kind_in(words: _Words, text: str) -> Optional[str]:
+    norm = _normalise_any(text)
+    if not norm:
+        return None
+    if words.goodbye.search(norm):
+        return GOODBYE
+    asks = "?" in (text or "") or "؟" in (text or "") or bool(words.question.search(norm))
+    if words.decline_anywhere.search(norm) and not asks:
+        return DECLINE
+    if words.bare_no.match(norm) and len(norm.split()) <= MAX_BARE_NO_WORDS and not asks:
+        return DECLINE
+    if words.thanks_only.match(norm):
+        return DECLINE
+    return None
+
+
+def caller_reply_kind(text: str, language: str = "en") -> Optional[str]:
     """Classify the caller's last utterance (see module docstring)."""
+    words = _BY_LANGUAGE.get((language or "en").split("-")[0].lower())
+    if words is not None:
+        return _kind_in(words, text)
     norm = _normalise(text or "")
     if not norm:
         return None
@@ -67,8 +137,8 @@ def caller_reply_kind(text: str) -> Optional[str]:
     asks = "?" in (text or "") or bool(_QUESTION_WORDS.search(norm))
     if _DECLINE_ANYWHERE.search(norm) and not asks:
         return DECLINE
-    words = norm.split()
-    if _BARE_NO.match(norm) and len(words) <= MAX_BARE_NO_WORDS and not asks:
+    words_en = norm.split()
+    if _BARE_NO.match(norm) and len(words_en) <= MAX_BARE_NO_WORDS and not asks:
         return DECLINE
     if _THANKS_ONLY.match(norm):
         return DECLINE
@@ -85,7 +155,7 @@ _NEW_REQUEST = re.compile(
 )
 
 
-def interrupts_closing(text: str) -> bool:
+def interrupts_closing(text: str, language: str = "en") -> bool:
     """Should these words, said while the closing line is playing, stop it?
 
     Only a real new request does: a question, or a phrase like "wait" or "one
@@ -93,6 +163,16 @@ def interrupts_closing(text: str) -> bool:
     to someone else in the room does not - the bot finishes the line and
     hangs up. Decided from the transcript alone.
     """
+    words = _BY_LANGUAGE.get((language or "en").split("-")[0].lower())
+    if words is not None:
+        norm = _normalise_any(text)
+        if not norm:
+            return False
+        if words.new_request.search(norm):
+            return True
+        if _kind_in(words, text) is not None:
+            return False
+        return "?" in (text or "") or "؟" in (text or "") or bool(words.question.search(norm))
     norm = _normalise(text or "")
     if not norm:
         return False

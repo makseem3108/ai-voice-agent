@@ -31,6 +31,19 @@ class Settings:
 
     #: Speech-to-text. ``repr=False`` keeps the key out of logs and tracebacks.
     deepgram_api_key: str = field(default="", repr=False)
+    #: Nova-3 turn taking (Hebrew / Arabic profiles): pause that ends a turn,
+    #: Deepgram's slower backup signal, and our own last-resort timeout.
+    nova_endpointing_ms: int = 500
+    nova_utterance_end_ms: int = 1000
+    nova_turn_timeout_ms: int = 2500
+    azure_speech_key: str = field(default="", repr=False)
+    azure_speech_region: str = ""
+    #: Our own cap on Azure TTS requests per minute (free tier allows 20).
+    azure_tts_max_per_minute: int = 20
+    #: Monthly usage counters (requests / characters per service).
+    usage_dir: Path = PROJECT_ROOT / "data" / "usage"
+    #: Test audio written by scripts/say.py; deleted after 7 days.
+    tmp_audio_dir: Path = PROJECT_ROOT / "data" / "tmp"
     stt_enabled: bool = True
     deepgram_model: str = "nova-3"
     deepgram_language: str = "en"
@@ -41,9 +54,15 @@ class Settings:
     #: server falls back to transcription only (phase 2a behaviour).
     agent_enabled: bool = True
     active_profile: str = "lead_qualification"
+    #: More lines, each with its own profile on its own local port, e.g.
+    #: ``clinic_he:9093,clinic_ar:9094``. The dialplan sends an extension to a port.
+    extra_profiles: tuple[tuple[str, int], ...] = ()
     profiles_dir: Path = PROJECT_ROOT / "profiles"
     groq_api_key: str = field(default="", repr=False)
     groq_model: str = "openai/gpt-oss-120b"
+    #: Used for a while when Groq refuses the main model for the day (its
+    #: per-day token limit). It has its own daily allowance. Empty = no fallback.
+    groq_fallback_model: str = "openai/gpt-oss-20b"
     #: Eager head starts are skipped while less than this share of the
     #: per-minute token allowance is left (0 = never skip).
     groq_eager_min_budget: float = 0.4
@@ -144,6 +163,22 @@ def _bool(values: Mapping[str, str], key: str, default: bool) -> bool:
     raise ValueError(f"{key} must be true or false, got {raw!r}")
 
 
+def _extra_profiles(raw: str) -> tuple[tuple[str, int], ...]:
+    """``"clinic_he:9093, clinic_ar:9094"`` -> ``(("clinic_he", 9093), ("clinic_ar", 9094))``."""
+    pairs: list[tuple[str, int]] = []
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, _, port = item.partition(":")
+        if not name.strip() or not port.strip().isdigit() or not 1024 <= int(port) <= 65535:
+            raise ValueError(f"EXTRA_PROFILES: {item!r} is not profile:port (port 1024-65535)")
+        pairs.append((name.strip(), int(port)))
+    if len({port for _, port in pairs}) != len(pairs):
+        raise ValueError("EXTRA_PROFILES: every profile needs its own port")
+    return tuple(pairs)
+
+
 def load_settings(
     env_file: Path = DEFAULT_ENV_FILE,
     environ: Optional[Mapping[str, str]] = None,
@@ -158,6 +193,14 @@ def load_settings(
         echo_mode=_bool(values, "ECHO_MODE", False),
         echo_delay_ms=_int(values, "ECHO_DELAY_MS", 1000, 0, 10_000),
         deepgram_api_key=(values.get("DEEPGRAM_API_KEY") or "").strip(),
+        nova_endpointing_ms=_int(values, "NOVA_ENDPOINTING_MS", 500, 10, 5000),
+        nova_utterance_end_ms=_int(values, "NOVA_UTTERANCE_END_MS", 1000, 1000, 5000),
+        nova_turn_timeout_ms=_int(values, "NOVA_TURN_TIMEOUT_MS", 2500, 0, 20000),
+        azure_speech_key=(values.get("AZURE_SPEECH_KEY") or "").strip(),
+        azure_speech_region=(values.get("AZURE_SPEECH_REGION") or "").strip().lower(),
+        azure_tts_max_per_minute=_int(values, "AZURE_TTS_MAX_PER_MINUTE", 20, 1, 1000),
+        usage_dir=Path(values["USAGE_DIR"]) if values.get("USAGE_DIR") else PROJECT_ROOT / "data" / "usage",
+        tmp_audio_dir=Path(values["TMP_AUDIO_DIR"]) if values.get("TMP_AUDIO_DIR") else PROJECT_ROOT / "data" / "tmp",
         stt_enabled=_bool(values, "STT_ENABLED", True),
         deepgram_model=values.get("DEEPGRAM_MODEL") or "nova-3",
         deepgram_language=values.get("DEEPGRAM_LANGUAGE") or "en",
@@ -165,9 +208,11 @@ def load_settings(
         deepgram_utterance_end_ms=_int(values, "DEEPGRAM_UTTERANCE_END_MS", 1000, 1000, 5000),
         agent_enabled=_bool(values, "AGENT_ENABLED", True),
         active_profile=(values.get("ACTIVE_PROFILE") or "lead_qualification").strip(),
+        extra_profiles=_extra_profiles(values.get("EXTRA_PROFILES") or ""),
         profiles_dir=Path(values["PROFILES_DIR"]) if values.get("PROFILES_DIR") else PROJECT_ROOT / "profiles",
         groq_api_key=(values.get("GROQ_API_KEY") or "").strip(),
         groq_model=values.get("GROQ_MODEL") or "openai/gpt-oss-120b",
+        groq_fallback_model=(values["GROQ_FALLBACK_MODEL"].strip() if "GROQ_FALLBACK_MODEL" in values else "openai/gpt-oss-20b"),
         groq_eager_min_budget=_float(values, "GROQ_EAGER_MIN_BUDGET", 0.4, 0.0, 1.0),
         aura_model=values.get("AURA_MODEL") or "aura-2-thalia-en",
         flux_model=values.get("FLUX_MODEL") or "flux-general-en",

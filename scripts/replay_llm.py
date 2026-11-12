@@ -44,12 +44,17 @@ sys.path.insert(0, str(ROOT))
 import httpx  # noqa: E402
 
 from app.config import load_settings  # noqa: E402
-from app.llm_groq import GroqLLM, LLMError, LLMUsage  # noqa: E402
+from app.llm_groq import GroqLLM, LLMError, LLMUsage, TokenLedger  # noqa: E402
 from app.profiles import Profile, load_profile  # noqa: E402
 from app.prompt_builder import ANYTHING_ELSE_QUESTION, build_directive, build_system_prompt  # noqa: E402
 from app.slots import FINAL, Plan, empty_slots, make_plan, merge_slots, reply_schema  # noqa: E402
+from app.text_utils import clean_fallback_text  # noqa: E402
 
 TOKENS_PER_MINUTE = 6000  # stay below Groq's 8,000 free-tier limit
+#: Requests one run may send. The free tier also has a DAILY token limit
+#: (200,000 per model, about 140 replies) that the phone line shares: a big
+#: replay can use up the day's calls. More than this needs --allow-more.
+MAX_REQUESTS = 30
 
 
 @dataclass
@@ -65,7 +70,7 @@ class Scenario:
 
 
 def english_scenarios() -> list[Scenario]:
-    """Scenarios for the lead_qualification profile. he/ar are added with their profiles."""
+    """Scenarios for the lead_qualification profile (English). Clinic profiles: see clinic_scenarios."""
     q_own = "Great, solar panels! Do you own the house, or do you rent?"
     q_bill = "Roughly how much is your monthly electricity bill?"
     return [
@@ -127,6 +132,64 @@ def english_scenarios() -> list[Scenario]:
     ]
 
 
+#: What a caller says in the clinic scenarios, per language.
+CLINIC_LINES = {
+    "en": {
+        "hours": "What are your opening hours?",
+        "reason": "I have a toothache.",
+        "how_long": "Wait, how long does a check-up take?",
+        "two": "It's my first visit, and I'd like Tuesday morning.",
+        "braces": "I need braces for my son.",
+        "bye": "Zero five two, one two three, four five six seven. Thanks, goodbye.",
+    },
+    "he": {
+        "hours": "מה שעות הפתיחה שלכם?",
+        "reason": "יש לי כאב שיניים.",
+        "how_long": "רגע, כמה זמן לוקחת בדיקה?",
+        "two": "זה ביקור ראשון, ואני רוצה ביום שלישי בבוקר.",
+        "braces": "אני צריך יישור שיניים לבן שלי, גשר.",
+        "bye": "אפס חמש שתיים, אחת שתיים שלוש, ארבע חמש שש שבע. תודה, להתראות.",
+    },
+    "ar": {
+        "hours": "شو ساعات الدوام عندكم؟",
+        "reason": "عندي وجع أسنان.",
+        "how_long": "لحظة، قديش بياخد الفحص؟",
+        "two": "هاي أول زيارة، وبدي يوم الثلاثا الصبح.",
+        "braces": "بدي تقويم أسنان لابني.",
+        "bye": "صفر خمسة اثنين، واحد اثنين ثلاثة، أربعة خمسة ستة سبعة. شكراً، مع السلامة.",
+    },
+}
+
+
+def clinic_scenarios(profile: Profile) -> list[Scenario]:
+    """The same six situations for clinic / clinic_he / clinic_ar ("*" = any non-empty value)."""
+    say = CLINIC_LINES[profile.language.split("-")[0]]
+    ask = {slot.name: slot.question or "" for slot in profile.slots}
+    return [
+        Scenario("question right after the greeting", [say["hours"]]),
+        Scenario("plain answer", [say["reason"]], expect={"reason": "*"}),
+        Scenario("question after one answer", [say["reason"], ask["patient_status"], say["how_long"]], known={"reason": say["reason"]}),
+        Scenario(
+            "two answers at once",
+            [say["reason"], ask["patient_status"], say["two"]],
+            known={"reason": say["reason"]},
+            expect={"patient_status": "new", "preferred_time": "*"},
+        ),
+        Scenario("not a fit (braces)", [say["braces"]], expect={"service_offered": "no"}),
+        Scenario(
+            "goodbye that carries an answer",
+            [say["reason"], ask["phone"], say["bye"]],
+            known={"reason": say["reason"], "patient_status": "new", "preferred_time": "Tuesday", "name": "Dana"},
+            expect={"phone": "*"},
+            final=True,
+        ),
+    ]
+
+
+def scenarios_for(profile: Profile) -> list[Scenario]:
+    return clinic_scenarios(profile) if profile.name.startswith("clinic") else english_scenarios()
+
+
 def build_messages(profile: Profile, scenario: Scenario) -> tuple[list[dict[str, str]], dict[str, Any]]:
     slots, _ = merge_slots(profile.slots, empty_slots(profile.slots), scenario.known)
     plan = Plan(FINAL) if scenario.final else make_plan(profile.slots, slots, scenario.announced, profile.outcomes)
@@ -150,7 +213,10 @@ def check(profile: Profile, scenario: Scenario, slots: dict[str, Any], reply: di
         got = merged.get(name)
         if isinstance(got, dict):
             got = got.get("amount")
-        if str(got).lower() != str(wanted).lower():
+        if wanted == "*":
+            if got in (None, ""):
+                return f"{name} is empty, expected a value"
+        elif str(got).lower() != str(wanted).lower():
             return f"{name}={got!r}, expected {wanted!r}"
     return None
 
@@ -161,6 +227,8 @@ async def main() -> int:
     parser.add_argument("--profile", default="lead_qualification")
     parser.add_argument("--only", default="", help="run only scenarios whose name contains this text")
     parser.add_argument("--show", action="store_true", help="print what the model said in each run")
+    parser.add_argument("--model", default="", help="send to this model instead of GROQ_MODEL (e.g. openai/gpt-oss-20b)")
+    parser.add_argument("--allow-more", action="store_true", help=f"lift the limit of {MAX_REQUESTS} requests per run (uses up the daily token allowance)")
     args = parser.parse_args()
 
     settings = load_settings(ROOT / ".env")
@@ -168,15 +236,24 @@ async def main() -> int:
         print("GROQ_API_KEY is not set in .env")
         return 2
     profile = load_profile(args.profile, ROOT / "profiles")
-    scenarios = [s for s in english_scenarios() if args.only.lower() in s.name.lower()]
+    scenarios = [s for s in scenarios_for(profile) if args.only.lower() in s.name.lower()]
     schema = reply_schema(profile.slots)
-    print(f"profile={profile.name} language={profile.language} model={settings.groq_model} runs per scenario={args.runs}\n")
+    model = args.model or settings.groq_model
+    planned = len(scenarios) * args.runs
+    if planned > MAX_REQUESTS and not args.allow_more:
+        print(f"{planned} runs planned, more than the budget of {MAX_REQUESTS} requests per run. Use fewer --runs or --only, or --allow-more.")
+        return 2
+    ledger = TokenLedger(settings.usage_dir / "groq_tokens.json")  # the same count the phone line uses
+    print(f"profile={profile.name} language={profile.language} model={model} runs per scenario={args.runs}\n")
+    requests_sent = 0
 
     totals = {"json": 0, "function_call": 0, "fallback": 0, "apology": 0}
     wrong = 0
+    first_try_tokens: list[tuple[int, int]] = []  # (prompt, completion) of replies that needed one request
+    wrong_language = 0
     latency: dict[str, list[float]] = {key: [] for key in totals}
     async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as http:
-        llm = GroqLLM(http, settings.groq_api_key, settings.groq_model)
+        llm = GroqLLM(http, settings.groq_api_key, model, ledger=ledger)  # no fallback model: we test exactly this one
         llm.fallback_language = profile.language
         for scenario in scenarios:
             messages, slots = build_messages(profile, scenario)
@@ -184,6 +261,9 @@ async def main() -> int:
             notes: list[str] = []
             times: list[float] = []
             for _ in range(args.runs):
+                if requests_sent >= MAX_REQUESTS and not args.allow_more:
+                    notes.append(f"stopped: {MAX_REQUESTS} requests sent (retries count too)")
+                    break
                 usage = LLMUsage()
                 started = time.monotonic()
                 try:
@@ -199,11 +279,21 @@ async def main() -> int:
                             outcome_ok = True
                     else:
                         outcome_ok = False
+                    if usage.requests == 1:
+                        first_try_tokens.append((usage.prompt_tokens, usage.completion_tokens))
+                    if not scenario.final and clean_fallback_text(str(reply.get("say") or ""), profile.language) is None:
+                        wrong_language += 1
+                        notes.append(f"say is not clean {profile.language}: {str(reply.get('say'))[:80]!r}")
                     if args.show or outcome == "fallback":
                         notes.append(f"{outcome} said: {str(reply.get('say'))[:100]!r}")
                 except LLMError as exc:
                     outcome, outcome_ok = "apology", False
                     notes.append(str(exc)[:80])
+                    if "429" in str(exc):
+                        # Over the per-minute limit (something else is using the key too):
+                        # wait it out, or every following run fails the same way.
+                        await asyncio.sleep(30.0)
+                requests_sent += usage.requests
                 elapsed = (time.monotonic() - started) * 1000.0
                 times.append(elapsed)
                 latency[outcome].append(elapsed)
@@ -228,6 +318,13 @@ async def main() -> int:
     everything = [t for values in latency.values() for t in values]
     passed_total = totals["json"] + totals["function_call"] - wrong
     print(f"  wrong slot values: {wrong}   overall avg latency: {sum(everything) / max(len(everything), 1):.0f} ms")
+    if first_try_tokens:
+        prompt_avg = sum(p for p, _ in first_try_tokens) / len(first_try_tokens)
+        completion_avg = sum(c for _, c in first_try_tokens) / len(first_try_tokens)
+        print(f"  tokens per reply (one request): prompt {prompt_avg:.0f} + completion {completion_avg:.0f} = {prompt_avg + completion_avg:.0f}")
+    print(f"  replies not in {profile.language}: {wrong_language}")
+    day = ledger.last_24h().get(model, {"tokens": 0, "requests": 0})
+    print(f"  requests sent: {requests_sent}; {model} in the last 24 h (our own count): {day['tokens']} tokens, {day['requests']} requests")
     print(f"pass rate (reply with correct slots): {passed_total}/{runs} ({100.0 * passed_total / max(runs, 1):.0f}%)")
     return 0 if passed_total == runs else 1
 

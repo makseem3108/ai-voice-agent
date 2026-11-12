@@ -39,14 +39,15 @@ from .audiosocket import (
 )
 from .call_log import CallRecorder, format_record
 from .config import Settings, load_settings
-from .llm_groq import GroqLLM
+from .llm_groq import DAILY_TOKEN_LIMIT, GroqLLM, TokenLedger
 from .phrase_cache import PhraseCache
 from .profiles import Profile, ProfileError, load_profile
 from .prompt_builder import build_system_prompt
 from . import rtp_stats
 from .recording import RETENTION_DAYS, InboundRecorder, cleanup_old_recordings
-from .providers import check_providers, make_stt, make_tts
+from .providers import check_providers, describe_stt, make_stt, make_tts, stt_eager
 from .speech import SpeechEvent, STTProvider, TTSProvider
+from .tts_azure import FREE_TIER_CHARS_PER_MONTH
 from .stt_deepgram import AudioClock, DeepgramParams, DeepgramStream, SttEvent, TranscriptTracker
 from .vad import BargeInDetector
 
@@ -82,6 +83,33 @@ async def record_rtp_stats(settings: Settings, call_id: str, started_wall: float
         log.exception("could not record RTP statistics")
 
 
+def format_llm_day(totals: dict[str, dict[str, int]]) -> str:
+    """``gpt-oss-120b:41.2k/200k,gpt-oss-20b:3.0k/200k`` - our own count for the last 24 hours."""
+    if not totals:
+        return "none"
+    return ",".join(
+        f"{model.split('/')[-1]}:{entry['tokens'] / 1000.0:.1f}k/{DAILY_TOKEN_LIMIT // 1000}k" for model, entry in sorted(totals.items())
+    )
+
+
+def tts_usage_record(tts: Optional[TTSProvider], call_chars: int) -> Optional[dict[str, Any]]:
+    """Quota bookkeeping for text-to-speech services that have a monthly allowance (Azure)."""
+    meter = getattr(tts, "usage", None)
+    if tts is None or meter is None:
+        return None
+    month = meter.month()
+    return {
+        "type": "tts_usage",
+        "provider": tts.name,
+        "voice": tts.voice,
+        "call_chars": call_chars,
+        "month": month["month"],
+        "month_chars": month["chars"],
+        "month_requests": month["requests"],
+        "month_limit": getattr(meter, "monthly_limit", FREE_TIER_CHARS_PER_MONTH),
+    }
+
+
 @dataclass
 class Services:
     """Things shared by all calls, built once at start-up."""
@@ -92,6 +120,8 @@ class Services:
     http: Optional[httpx.AsyncClient] = None
     llm: Optional[GroqLLM] = None
     tts: Optional[TTSProvider] = None
+    #: The local port this line listens on (None = the main one, settings.port).
+    port: Optional[int] = None
     phrases: Optional[PhraseCache] = None
 
     async def keep_warm(self) -> None:
@@ -136,23 +166,66 @@ class Services:
         return mode + ("+echo" if self.settings.echo_mode else "")
 
 
-def build_services(settings: Settings) -> Services:
-    """Create shared clients. Raises :class:`ProfileError` for a bad profile."""
-    services = Services(settings)
+def build_services(
+    settings: Settings, profile_name: Optional[str] = None, port: Optional[int] = None, shared: Optional[Services] = None
+) -> Services:
+    """Create the clients for one line (one profile on one port).
+
+    The main line uses ``ACTIVE_PROFILE`` on ``PORT``. Extra lines
+    (``EXTRA_PROFILES``) pass their profile, their port and the main line's
+    services as ``shared``: they reuse its HTTP connections and its view of
+    the LLM token budget. Raises :class:`ProfileError` for a bad profile.
+    """
+    services = Services(settings, port=port)
     if not settings.agent_active:
         return services
-    services.profile = load_profile(settings.active_profile, settings.profiles_dir)
-    check_providers(services.profile)
+    services.profile = load_profile(profile_name or settings.active_profile, settings.profiles_dir)
+    check_providers(services.profile, settings)
     services.system_prompt = build_system_prompt(services.profile)
-    services.http = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
-        limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120.0),
+    if shared is not None and shared.http is not None:
+        services.http = shared.http
+    else:
+        services.http = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
+            limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120.0),
+        )
+    # One account: every line shares the per-minute budget and the 24-hour token ledger
+    # (which also knows when the main model is refused for the day).
+    ledger = shared.llm.ledger if shared is not None and shared.llm is not None else TokenLedger(settings.usage_dir / "groq_tokens.json")
+    services.llm = GroqLLM(
+        services.http,
+        settings.groq_api_key,
+        settings.groq_model,
+        fallback_model=settings.groq_fallback_model or None,
+        ledger=ledger,
     )
-    services.llm = GroqLLM(services.http, settings.groq_api_key, settings.groq_model)
     services.llm.fallback_language = services.profile.language
+    if shared is not None and shared.llm is not None:
+        services.llm.budget = shared.llm.budget
     services.tts = make_tts(services.profile, settings, services.http)
     services.phrases = PhraseCache(services.tts, settings.tts_cache_dir)
     return services
+
+
+def build_all_services(settings: Settings) -> list[Services]:
+    """The main line first, then one per ``EXTRA_PROFILES`` entry.
+
+    A broken extra profile is logged and skipped: it must not take the main
+    line down with it.
+    """
+    main_line = build_services(settings)
+    lines = [main_line]
+    if not main_line.agent_ready:
+        return lines
+    for name, port in settings.extra_profiles:
+        if port == settings.port:
+            log.error("extra profile '%s' is not started: port %d is the main line's port", name, port)
+            continue
+        try:
+            lines.append(build_services(settings, name, port, shared=main_line))
+        except ProfileError as exc:
+            log.error("extra profile '%s' is not started: %s", name, exc)
+    return lines
 
 
 @dataclass
@@ -324,6 +397,7 @@ class CallSession:
             record=self._log_record,
             hangup=self._agent_hangup,
             eager=stt.supports_eager,
+            merge_turns=bool(getattr(stt, "merges_turns", False)),
             eager_allowed=lambda: llm.budget.allows_eager(s.groq_eager_min_budget),
             detector=detector,
             barge_confirm_s=s.barge_confirm_ms / 1000.0,
@@ -350,10 +424,17 @@ class CallSession:
             a = self._agent.summary()
             summary.update(a)
             summary["stt_failed"] = bool(self._agent_stt and self._agent_stt.failed)
+            turns_by = getattr(self._agent_stt, "turns_by", None)
+            if turns_by is not None:
+                summary["stt_turns_ended_by"] = dict(turns_by)  # Nova-3: speech_final / utterance_end / timeout
             self._record(summary)
+            summary["llm_tokens_24h"] = llm_day = self._services.llm.ledger.last_24h() if self._services.llm else {}
+            usage = tts_usage_record(self._services.tts, a["tts_chars"])
+            if usage is not None:
+                self._log_record(usage)
             log.info(
                 "call ended uuid=%s duration=%.2fs turns=%d total_ms_avg=%s total_ms_max=%s barge_ins=%d "
-                "false_pauses=%d outcome=%s replans=%d llm_paths=%s stt_audio_s=%.2f llm_tokens=%d llm_cached=%d eager_skipped=%d tts_chars=%d errors=%d "
+                "false_pauses=%d outcome=%s replans=%d llm_paths=%s llm_24h=%s stt_audio_s=%.2f llm_tokens=%d llm_cached=%d eager_skipped=%d tts_chars=%d errors=%d "
                 "frames_in=%d frames_out=%d reason=%s",
                 s.call_uuid or "unknown",
                 s.duration_s(),
@@ -365,6 +446,7 @@ class CallSession:
                 a["outcome"] or "none",
                 a["replans"],
                 "/".join(f"{name}:{count}" for name, count in a["llm_paths"].items()),
+                format_llm_day(llm_day),
                 self._clock.total_seconds,
                 a["llm_tokens"],
                 a["llm_cached_tokens"],
@@ -528,34 +610,52 @@ class CallSession:
             pass
 
 
-async def serve(services: Services) -> None:
-    """Run the server until SIGTERM / SIGINT."""
+async def serve(lines: "Services | list[Services]") -> None:
+    """Run the server until SIGTERM / SIGINT. One listening port per line."""
+    all_lines = lines if isinstance(lines, list) else [lines]
+    services = all_lines[0]
     settings = services.settings
 
-    async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await CallSession(reader, writer, services).run()
+    def handler(line: Services) -> Any:
+        async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await CallSession(reader, writer, line).run()
 
-    server = await asyncio.start_server(on_connect, host=settings.host, port=settings.port)
-    bound = ", ".join(f"{s.getsockname()[0]}:{s.getsockname()[1]}" for s in server.sockets or ())
-    if services.agent_ready and services.profile is not None:
-        log.info(
-            "AudioSocket server listening on %s (mode=%s profile=%s stt=%s llm=%s tts=%s eager=%s keyterms=%d local_vad=%s)",
-            bound,
-            services.mode,
-            services.profile.name,
-            services.profile.stt.model or settings.flux_model,
-            settings.groq_model,
-            services.tts.voice if services.tts is not None else "-",
-            "on" if settings.flux_eager_eot_threshold > 0 else "off",
-            len(services.profile.keyterms),
-            "on" if settings.barge_vad_enabled else "off",
-        )
-    else:
-        if settings.agent_enabled:
-            log.warning("agent mode is off: DEEPGRAM_API_KEY and GROQ_API_KEY are both required")
-        log.info("AudioSocket server listening on %s (mode=%s model=%s)", bound, services.mode, settings.deepgram_model)
+        return on_connect
+
+    servers: list[asyncio.AbstractServer] = []
+    started: list[Services] = []
+    for line in all_lines:
+        port = line.port or settings.port
+        try:
+            server = await asyncio.start_server(handler(line), host=settings.host, port=port)
+        except OSError as exc:
+            if line is services:
+                raise
+            log.error("extra profile '%s' is not started: cannot listen on port %d (%s)", line.profile.name if line.profile else "?", port, exc)
+            continue
+        servers.append(server)
+        started.append(line)
+        bound = ", ".join(f"{s.getsockname()[0]}:{s.getsockname()[1]}" for s in server.sockets or ())
+        if line.agent_ready and line.profile is not None:
+            log.info(
+                "AudioSocket server listening on %s (mode=%s profile=%s stt=%s llm=%s tts=%s eager=%s keyterms=%d local_vad=%s)",
+                bound,
+                line.mode,
+                line.profile.name,
+                describe_stt(line.profile, settings),
+                settings.groq_model,
+                line.tts.voice if line.tts is not None else "-",
+                "on" if stt_eager(line.profile, settings) else "off",
+                len(line.profile.keyterms),
+                "on" if settings.barge_vad_enabled else "off",
+            )
+        else:
+            if settings.agent_enabled:
+                log.warning("agent mode is off: DEEPGRAM_API_KEY and GROQ_API_KEY are both required")
+            log.info("AudioSocket server listening on %s (mode=%s model=%s)", bound, line.mode, settings.deepgram_model)
 
     cleanup_old_recordings(settings.recordings_dir)
+    cleanup_old_recordings(settings.tmp_audio_dir)  # test audio from scripts/say.py, same 7-day rule
     rtp_stats.cleanup_stale(settings.rtp_stats_dir)
     if settings.debug_record_audio:
         log.warning(
@@ -565,10 +665,14 @@ async def serve(services: Services) -> None:
             RETENTION_DAYS,
         )
 
-    warmup: Optional[asyncio.Task[None]] = None
-    if services.agent_ready and services.phrases is not None and services.profile is not None:
-        # Pre-generate greeting / apology / goodbye so the first call starts instantly.
-        warmup = asyncio.get_running_loop().create_task(services.phrases.warm(fixed_phrases(services.profile)))
+    async def warm_all() -> None:
+        # Pre-generate greeting / apology / closings so the first call starts instantly.
+        # One line after the other: services with a request limit are not hit in parallel.
+        for line in started:
+            if line.agent_ready and line.phrases is not None and line.profile is not None:
+                await line.phrases.warm(fixed_phrases(line.profile))
+
+    warmup: Optional[asyncio.Task[None]] = asyncio.get_running_loop().create_task(warm_all())
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -576,12 +680,14 @@ async def serve(services: Services) -> None:
         loop.add_signal_handler(sig, stop.set)
 
     try:
-        async with server:
-            await stop.wait()
-            log.info("shutting down")
+        await stop.wait()
+        log.info("shutting down")
     finally:
         if warmup is not None:
             warmup.cancel()
+        for server in servers:
+            server.close()
+        await asyncio.gather(*(server.wait_closed() for server in servers), return_exceptions=True)
         if services.http is not None:
             await services.http.aclose()
 
@@ -605,11 +711,11 @@ def main() -> None:
 
     async def run() -> None:
         try:
-            services = build_services(settings)
+            lines = build_all_services(settings)
         except ProfileError as exc:
             log.error("cannot start: %s", exc)
             raise SystemExit(EXIT_CONFIG) from None
-        await serve(services)
+        await serve(lines)
 
     asyncio.run(run())
 

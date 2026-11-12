@@ -157,6 +157,7 @@ class Rig:
         end_silence_s: float = 0.05,
         end_silence_max_s: float = 1.0,
         end_hold_max_s: float = 1.0,
+        merge_turns: bool = False,
     ) -> None:
         self.llm = llm or FakeLLM()
         self.tts = tts or FakeTTS()
@@ -185,6 +186,7 @@ class Rig:
             end_silence_s=end_silence_s,
             end_silence_max_s=end_silence_max_s,
             end_hold_max_s=end_hold_max_s,
+            merge_turns=merge_turns,
         )
 
     def event(self, kind: str, text: str = "", end: float = 5.0) -> None:

@@ -1,0 +1,74 @@
+# Fictional business - demo profile. Hebrew version of clinic.yaml (same slots).
+language: he
+stt:
+  provider: nova3          # Deepgram Nova-3, language taken from `language`
+tts:
+  provider: azure
+  voice: he-IL-HilaNeural
+business_name: מרפאת השיניים הרבור
+agent_role: the front desk assistant who handles appointment requests
+goal: >
+  Take an appointment request: who the patient is, what they need and when
+  they would like to come in, so the front desk can confirm the booking.
+greeting: שלום, הגעתם למרפאת השיניים הרבור. מדברת העוזרת הווירטואלית. במה אפשר לעזור?
+
+slots:
+  - name: service_offered
+    type: yes_no
+    required: false
+    description: >
+      no only if the caller clearly needs something a general dentist does not do
+      (for example braces, surgery in hospital, or a non-dental problem). Otherwise leave it empty or yes.
+    disqualifying: ["no"]
+    not_fit_reason: we are a general dentistry practice and do not offer that treatment
+  - name: reason
+    type: text
+    question: מה סיבת הביקור? למשל בדיקה, ניקוי או כאב שיניים.
+  - name: patient_status
+    type: choice
+    values: [new, existing]
+    question: כבר טופלתם אצלנו, או שזה ביקור ראשון?
+    description: new for a first visit, existing if they have been treated here before.
+  - name: preferred_time
+    type: text
+    question: איזה יום ואיזו שעה מתאימים לכם?
+  - name: name
+    type: text
+    question: מה השם המלא?
+  - name: phone
+    type: text
+    question: לאיזה מספר טלפון לחזור כדי לאשר את התור?
+
+knowledge: |
+  מרפאת השיניים הרבור היא מרפאה לרפואת שיניים כללית.
+  שעות הפתיחה: ימים ראשון עד חמישי, משמונה בבוקר עד חמש אחר הצהריים. בשישי ובשבת המרפאה סגורה.
+  אנחנו מציעים בדיקות, ניקוי שיניים, סתימות, כתרים והלבנה.
+  בדיקה עם ניקוי נמשכת כארבעים וחמש דקות.
+  מטופלים חדשים מתבקשים להגיע עשר דקות לפני התור כדי למלא טופס.
+  העוזרת רק רושמת בקשה; המזכירות מאשרת את השעה המדויקת בטלפון.
+  במקרה של כאב חזק, נפיחות או דימום יש תורים דחופים באותו יום, בימי חול.
+  איננו נותנים ייעוץ רפואי או אבחנות בטלפון.
+  לטיפולים שאיננו מציעים, רופא המשפחה או רופא מומחה יכולים לתת הפניה.
+tone: calm, kind and reassuring
+# Said when an appointment request has been taken.
+closing_qualified: תודה. המזכירות תחזור אליכם לאישור התור. יום טוב!
+# Said when we cannot help (for example something we do not treat). No promises here.
+closing_not_fit: מצטערת, בזה לא נוכל לעזור כאן. תודה שהתקשרתם למרפאת השיניים הרבור, ויום טוב!
+max_call_seconds: 300
+# Words speech recognition should listen for.
+keyterms:
+  - תור
+  - בדיקה
+  - ניקוי
+  - סתימה
+  - כתר
+  - הלבנה
+  - כאב שיניים
+  - נפיחות
+  - דימום
+  - חירום
+  - מטופל חדש
+  - מטופל קיים
+  - רופא שיניים
+  - קופת חולים
+  - הרבור

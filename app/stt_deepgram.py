@@ -48,6 +48,14 @@ class DeepgramParams:
     language: str = "en"
     endpointing_ms: int = 400
     utterance_end_ms: int = 1000
+    #: Domain words the model should listen for ("keyterm prompting"), in any script.
+    keyterms: tuple[str, ...] = ()
+    #: Only with ``language="multi"``: languages to expect (biases detection).
+    language_hints: tuple[str, ...] = ()
+    #: Deepgram's formatting of numbers, dates and so on. Good for reading a
+    #: transcript; off for the agent, which wants the words as spoken
+    #: (in Hebrew it turned "יום שלישי", Tuesday, into "יום 3º").
+    smart_format: bool = True
 
     def query(self) -> dict[str, str]:
         return {
@@ -60,12 +68,17 @@ class DeepgramParams:
             "endpointing": str(self.endpointing_ms),
             "utterance_end_ms": str(self.utterance_end_ms),
             "vad_events": "true",
-            "smart_format": "true",
+            **({"smart_format": "true"} if self.smart_format else {"punctuate": "true"}),
         }
 
     def url(self) -> str:
         """Request URL. Contains no credentials, so it is safe to log."""
-        return f"{DEEPGRAM_URL}?{urlencode(self.query())}"
+        pairs = list(self.query().items())
+        # Repeatable parameters: one entry per term; urlencode handles Hebrew / Arabic text.
+        pairs += [("keyterm", term) for term in self.keyterms]
+        if self.language == "multi":
+            pairs += [("language_hint", hint) for hint in self.language_hints]
+        return f"{DEEPGRAM_URL}?{urlencode(pairs)}"
 
 
 # --------------------------------------------------------------------------- events

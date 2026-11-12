@@ -143,27 +143,43 @@ def _numbers(tokens: list[str]) -> list[Number]:
     current: Number = 0
     active = False
     last_was_digits = False
+    joined = False  # an "and" came just before this token: "ميتين و50" = two hundred and 50
 
     def close() -> None:
-        nonlocal total, current, active, last_was_digits
+        nonlocal total, current, active, last_was_digits, joined
         if active and total + current > 0:
             found.append(total + current)
-        total, current, active, last_was_digits = 0, 0, False, False
+        total, current, active, last_was_digits, joined = 0, 0, False, False, False
 
     for index, token in enumerate(tokens):
         if _NUMBER_RE.match(token):
             thousands = token.endswith("k")
             value = float(token.rstrip("k")) * (1000 if thousands else 1)
+            if (
+                active
+                and joined
+                and not last_was_digits
+                and value.is_integer()
+                and not _overlaps(current, int(value))
+            ):
+                # Speech-to-text often writes part of a spoken number in digits:
+                # "ميتين و50", "מאתיים ו-50", "two hundred and 50".
+                current += value
+                last_was_digits, joined = True, False
+                continue
             if active and (last_was_digits or current or total):
                 close()  # "150 200" are two numbers, not one
             current, active, last_was_digits = value, True, True
             continue
         key = _word_value(token)
         if key is None:
-            if active and token in _SKIP and index + 1 < len(tokens) and (
-                _word_value(tokens[index + 1]) is not None
-            ):
-                continue
+            if active and token in _SKIP and index + 1 < len(tokens):
+                following = tokens[index + 1]
+                if _word_value(following) is not None:
+                    continue
+                if _NUMBER_RE.match(following) and not last_was_digits:
+                    joined = True
+                    continue
             close()
             continue
         if key in _THOUSAND_WORDS:
@@ -179,7 +195,7 @@ def _numbers(tokens: list[str]) -> list[Number]:
             if active and (last_was_digits or (current and _overlaps(current, value))):
                 close()  # "500 five", "two hundred ... three hundred": separate numbers
             current += value
-        active, last_was_digits = True, False
+        active, last_was_digits, joined = True, False, False
     close()
     return found
 

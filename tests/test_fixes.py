@@ -301,7 +301,7 @@ def test_every_flux_turn_event_is_recorded_with_audio_timestamps() -> None:
     assert (start["audio_start"], start["audio_end"]) == (3.5, 4.0)
     assert start["bot_speaking"] is False and isinstance(start["lag_ms"], int)
     assert update["transcript"] == "Wait" and update["last_word_end"] == 4.3
-    assert (format_record(start) or "").startswith("[flux] StartOfTurn")
+    assert (format_record(start) or "").startswith("[stt] StartOfTurn")
     assert format_record(update) is None  # updates go to the call file only
 
 

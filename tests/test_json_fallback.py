@@ -278,3 +278,38 @@ def test_normal_turns_allow_the_fallback() -> None:
         return rig
 
     assert run(scenario).llm.text_fallback == [True]
+
+
+# ====================================================================== seen on the first Hebrew / Arabic test calls
+def test_function_call_with_a_wrong_function_name_is_salvaged() -> None:
+    """Groq: "attempted to call tool 'json' which was not in request.tools" - but the arguments were fine."""
+    generated = json.dumps({"name": "json", "arguments": {"slots": {"reason": None}, "say": "شو سبب الزيارة؟"}}, ensure_ascii=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if mode(request) == "json_schema":
+            return rejected("أنا هون لتسجيل طلب موعد. شو سبب الزيارة؟")
+        return httpx.Response(400, json={"error": {"message": "Tool call validation failed", "failed_generation": generated}})
+
+    result, usage = ask(groq(handler, language="ar"))
+    assert result == {"slots": {"reason": None}, "say": "شو سبب الزيارة؟", "path": "function_call"} and usage.requests == 2
+
+
+def test_rate_limit_on_the_retry_falls_back_to_the_clean_text_instead_of_an_apology() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if mode(request) == "json_schema":
+            return rejected("שלום, מה סיבת הביקור?")
+        return httpx.Response(429, json={"error": {"message": "Rate limit reached"}})
+
+    result, _ = ask(groq(handler, language="he"))
+    assert result == {"say": "שלום, מה סיבת הביקור?", "path": "text_fallback"}
+    with pytest.raises(LLMError, match="429"):  # with nothing clean in hand it is still an error
+        ask(groq(lambda r: httpx.Response(429, json={"error": {"message": "Rate limit reached"}}), language="he"))
+
+
+def test_account_identifiers_are_removed_from_error_messages() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"message": "Rate limit reached for model `m` in organization `org_01abcdefgh1234567890` on tokens per minute"}})
+
+    with pytest.raises(LLMError) as info:
+        ask(groq(handler))
+    assert "org_01abcdefgh" not in str(info.value) and "organization `org_***`" in str(info.value)

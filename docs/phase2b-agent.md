@@ -368,7 +368,7 @@ apartment" was heard as "the Toronto apartment". Two measures:
   `TurnResumed`, `EndOfTurn`) is stored in the call file as `stt_event`, with
   its audio timestamps, how long after that audio arrived Flux reported it
   (`lag_ms`), and whether the bot was speaking. `StartOfTurn` also appears in
-  the journal as a `[flux]` line.
+  the journal as a `[stt]` line.
 - The model's exact output, markers included, is stored as `llm_raw`.
 - **Debug audio recording** (`DEBUG_RECORD_AUDIO=true`): saves the caller's
   audio of each call to `data/recordings/<uuid>.wav`. **Off by default and for

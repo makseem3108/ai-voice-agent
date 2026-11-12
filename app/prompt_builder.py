@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from .lang import ENGLISH, pack
 from .profiles import Profile
 from .slots import (
     ANNOUNCE,
@@ -32,12 +33,31 @@ from .slots import (
 )
 
 #: Asked by the server (never by the model), once, after the outcome is known.
-ANYTHING_ELSE_QUESTION = "Is there anything else I can help you with?"
+#: This is the English wording; other languages come from :mod:`app.lang`.
+ANYTHING_ELSE_QUESTION = ENGLISH.anything_else
+
+
+def anything_else_question(profile: Profile) -> str:
+    return pack(profile.language).anything_else
 
 
 def incomplete_closing(profile: Profile) -> str:
     """Said when the caller says goodbye before we know whether we can help."""
-    return f"Thank you for calling {profile.business_name}. Goodbye!"
+    return pack(profile.language).neutral_closing.format(business=profile.business_name)
+
+
+def _language_section(profile: Profile) -> str:
+    """How to speak, for profiles that are not in English. Empty for English (prompt unchanged)."""
+    language = pack(profile.language)
+    notes = f"\n- {profile.speech_notes}" if profile.speech_notes else ""
+    if not language.speaking_rule and not notes:
+        return ""
+    return f"""LANGUAGE
+- The caller hears you in {language.name}. Every "say" is in {language.name} only, whatever language the caller uses or these instructions are written in.
+- {language.speaking_rule}{notes}
+- Slot values that are keywords (yes, no, and the listed choices) stay exactly as listed, in English. Text slots are written as the caller said them, in the caller's words.
+
+"""
 
 
 def _slot_line(slot: SlotDef) -> str:
@@ -64,7 +84,7 @@ SLOTS
 - Fill a slot only from what the caller actually said. Never guess. If the caller corrects themselves, use the new value.
 - You hear the caller through speech recognition, which makes mistakes. If something is surprising or out of context, leave the slot null and ask one short clarifying question instead of acting on it.
 
-HOW TO SPEAK ("say")
+{_language_section(profile)}HOW TO SPEAK ("say")
 - Tone: {profile.tone}. 1 or 2 short spoken sentences, never more. Plain words, no lists or markdown.
 - Ask at most one question, and only the one the INSTRUCTION for this turn tells you to ask.
 - Say amounts of money the way people speak ("five hundred shekels"), never as a currency code.

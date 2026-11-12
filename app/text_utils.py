@@ -11,7 +11,7 @@ _ABBREVIATIONS = frozenset(
     {"mr", "mrs", "ms", "dr", "prof", "st", "vs", "etc", "e.g", "i.e", "approx", "a.m", "p.m", "inc", "ltd"}
 )
 #: A sentence ends at . ! or ? (optionally followed by a closing quote/bracket) and then whitespace.
-_BOUNDARY = re.compile(r"""[.!?]+["')\]]*\s+""")
+_BOUNDARY = re.compile(r"""[.!?؟]+["')\]]*\s+""")
 _SOFT_BREAK = re.compile(r"[,;:]\s+")
 _MARKUP = re.compile(r"[*_#`~|<>]+")
 

@@ -49,6 +49,7 @@ from .audio_out import Pacer
 from .intent import DECLINE, GOODBYE, caller_reply_kind, interrupts_closing
 from .llm_groq import PATH_FUNCTION, PATH_JSON, PATH_TEXT, LLMError, LLMUsage
 from .profiles import Profile
+from .lang import ENGLISH, pack
 from .prompt_builder import ANYTHING_ELSE_QUESTION, build_directive, incomplete_closing
 from .slots import (
     ANNOUNCE,
@@ -77,6 +78,7 @@ from .speech import (
     SttError,
     SttInfo,
     TTSError,
+    TTSRateLimited,
     TurnEvent,
 )
 from .stt_deepgram import AudioClock
@@ -84,7 +86,12 @@ from .text_utils import SentenceSplitter, clean_for_speech
 
 log = logging.getLogger("voice_agent.agent")
 
-APOLOGY_TEXT = "Sorry, I'm having a little trouble on my end. Could you say that again?"
+#: English wording of the program's own phrases; other languages come from app/lang.py.
+APOLOGY_TEXT = ENGLISH.apology
+#: Said (from the phrase cache) when the text-to-speech service asks us to slow down.
+ONE_MOMENT_TEXT = ENGLISH.one_moment
+#: Longest we keep the caller waiting before the one retry after a rate limit.
+MAX_RATE_LIMIT_WAIT_S = 4.0
 MAX_HISTORY_MESSAGES = 24
 GREETING_TIMEOUT_S = 5.0
 DRAIN_TIMEOUT_S = 30.0
@@ -100,15 +107,9 @@ def hangup_reason(outcome: str) -> str:
     if outcome == OUTCOME_INCOMPLETE:
         return "caller-goodbye"
     return "goal-complete"  # qualified, or a profile-defined variant of it
-#: Any way of asking "is there anything else?" - only the server may ask this.
-_ANYTHING_ELSE_RE = re.compile(
-    r"\b(anything|something) (else|more)\b|\bany(thing)? other (question|thing)s?\b|\bother questions\b|\bany more questions\b",
-    re.IGNORECASE,
-)
-
-
-def asks_anything_else(text: str) -> bool:
-    return bool(_ANYTHING_ELSE_RE.search(text))
+def asks_anything_else(text: str, language: str = "en") -> bool:
+    """Any wording of "is there anything else?" - only the server may ask that."""
+    return pack(language).asks_anything_else(text)
 
 
 def split_sentences(text: str) -> list[str]:
@@ -118,10 +119,7 @@ def split_sentences(text: str) -> list[str]:
 
 def goodbye_text(profile: Profile) -> str:
     """Spoken when the call hits the profile's hard time limit."""
-    return (
-        "I'm sorry, but we've reached the time limit for this call. "
-        f"Thank you for calling {profile.business_name}. Goodbye!"
-    )
+    return pack(profile.language).time_limit.format(business=profile.business_name)
 
 
 def closing_text(profile: Profile, outcome: str) -> str:
@@ -140,8 +138,9 @@ def fixed_phrases(profile: Profile) -> list[str]:
     """Everything worth pre-generating for a profile."""
     return [
         profile.greeting,
-        APOLOGY_TEXT,
-        ANYTHING_ELSE_QUESTION,
+        pack(profile.language).apology,
+        pack(profile.language).one_moment,
+        pack(profile.language).anything_else,
         profile.closing_qualified,
         profile.closing_not_fit,
         *(variant.closing for variant in profile.outcomes),
@@ -267,6 +266,7 @@ class Agent:
         hangup: Callable[[str], None],
         eager: bool = True,
         eager_allowed: Callable[[], bool] = lambda: True,
+        merge_turns: bool = False,
         detector: Optional[VoiceDetector] = None,
         barge_confirm_s: float = 2.5,
         end_silence_s: float = 1.5,
@@ -275,6 +275,8 @@ class Agent:
         now: Callable[[], float] = time.time,
     ) -> None:
         self._profile = profile
+        #: The program's own phrases (apology, "one moment", ...) in the profile's language.
+        self._lang = pack(profile.language)
         self._defs = profile.slots
         self._variants = profile.outcomes
         self._schema = reply_schema(profile.slots)
@@ -288,6 +290,13 @@ class Agent:
         self._hangup = hangup
         self._eager = eager
         self._eager_allowed = eager_allowed
+        #: Speech-to-text that ends a turn on a plain pause (Nova-3) cuts callers
+        #: off between sentences. With this on, a caller who goes on speaking
+        #: before the reply is audible gets both parts answered as one turn.
+        self._merge_turns = merge_turns
+        self._last_end_of_turn: Optional[tuple[float, str]] = None  # (when, what was said)
+        self._merge: Optional[dict[str, Any]] = None
+        self.turn_merges = 0
         self.eager_skipped = 0
         self._detector = detector
         self._barge_confirm_s = barge_confirm_s
@@ -311,6 +320,9 @@ class Agent:
         self.tts_chars = 0
         self.replans = 0
         self.json_fallbacks = 0
+        self.tts_rate_limited = 0
+        #: Set when a reply of this call came from the fallback model (main model's daily limit reached).
+        self.llm_fallback_model: Optional[str] = None
         #: How many replies came through each path (see GroqLLM.reply_json).
         self.llm_paths: dict[str, int] = {PATH_JSON: 0, PATH_FUNCTION: 0, PATH_TEXT: 0}
         #: Set after a plain-text fallback turn that was asking for a slot which
@@ -483,9 +495,10 @@ class Agent:
                 "audio_end": round(event.audio_window_end, 3),
                 "last_word_end": None if event.last_word_end is None else round(event.last_word_end, 3),
                 "eot_confidence": round(event.eot_confidence, 3),
-                # how long after we received that audio Flux told us about it
+                # how long after we received that audio speech-to-text told us about it
                 "lag_ms": None if heard is None else round(max(0.0, (arrival_wall - heard) * 1000.0)),
                 "bot_speaking": self._pacer.speaking,
+                **({"details": event.details} if event.details else {}),
             }
         )
 
@@ -507,7 +520,7 @@ class Agent:
         text = event.transcript
         if not text:
             return
-        if interrupts_closing(text) and self._ends_the_call(text) is None:
+        if interrupts_closing(text, self._profile.language) and self._ends_the_call(text) is None:
             self._cancel_ending()
             self._on_end_of_turn(event, arrival_wall)  # clears the rest of the closing audio
             return
@@ -524,8 +537,13 @@ class Agent:
             self.barge_ins += 1
             self._record({"type": "barge_in", "dropped_frames": dropped, "local_pause_ms": _round(paused_ms)})
         elif job is not None and job.committed:
-            # We were still preparing a reply and the caller went on talking.
+            # We were still preparing a reply and the caller went on talking:
+            # drop that reply (nothing of it was heard). The conversation history
+            # joins the two parts, so the next reply answers both together.
             self._cancel_job(job, interrupted=False)
+            if self._merge_turns and self._last_end_of_turn is not None and self._merge is None:
+                ended, first = self._last_end_of_turn
+                self._merge = {"first": first, "gap_ms": round((time.monotonic() - ended) * 1000.0)}
 
     def _ends_the_call(self, text: str) -> Optional[str]:
         """If these words from the caller end the call, the outcome to close with.
@@ -538,7 +556,7 @@ class Agent:
           known yet: ``_EXTRACT_FIRST`` is returned and the sentence is read
           for slot values before the closing line is chosen.
         """
-        kind = caller_reply_kind(text)
+        kind = caller_reply_kind(text, self._profile.language)
         if kind is None:
             return None
         plan = self._plan()
@@ -599,6 +617,19 @@ class Agent:
                 "eot_confidence": round(event.eot_confidence, 3),
             }
         )
+        if self._merge is not None:
+            merge, self._merge = self._merge, None
+            self.turn_merges += 1
+            self._record(
+                {
+                    "type": "turn_merge",
+                    "turn": metrics.index,
+                    "gap_ms": merge["gap_ms"],
+                    "parts": [merge["first"], text],
+                    "text": f"{merge['first']} {text}",
+                }
+            )
+        self._last_end_of_turn = (time.monotonic(), text)
         if self._pacer.speaking:  # stale audio must never overlap a new reply
             self._pacer.clear()
         self._clear_pause()
@@ -667,6 +698,7 @@ class Agent:
             )
             job.raw.append(reply)
             job.paths.append(str(reply.get("path") or PATH_JSON))
+            self._note_model(reply)
             slots, job.rejected = merge_slots(self._defs, slots, reply.get("slots"))
         except asyncio.CancelledError:
             raise
@@ -714,6 +746,7 @@ class Agent:
             )
             job.raw.append(reply)
             job.paths.append(str(reply.get("path") or PATH_JSON))
+            self._note_model(reply)
             merged, job.rejected = merge_slots(self._defs, slots_before, reply.get("slots"))
             plan_after = make_plan(self._defs, merged, announced, self._variants)
             if not plans_consistent(plan, plan_after):
@@ -726,6 +759,7 @@ class Agent:
                 reply = await self._llm.reply_json(self._messages(job, plan, merged, replanned=True), self._schema, self.llm_usage)
                 job.raw.append(reply)
                 job.paths.append(str(reply.get("path") or PATH_JSON))
+                self._note_model(reply)
                 merged, more = merge_slots(self._defs, merged, reply.get("slots"))
                 job.rejected += more
             job.llm_first_token_ms = (self._now() - started) * 1000.0
@@ -735,17 +769,20 @@ class Agent:
             sentences = [clean_for_speech(s) for s in split_sentences(str(reply.get("say") or ""))]
             sentences = [s for s in sentences if s and any(ch.isalnum() for ch in s)]
             # "Anything else?" belongs to the server. Drop it if the model says it anyway.
-            kept = [s for s in sentences if not asks_anything_else(s)]
+            kept = [s for s in sentences if not self._lang.asks_anything_else(s)]
             if not sentences:
                 raise LLMError("the model returned an empty reply")
             if not kept and plan.kind != ANNOUNCE:
                 kept = sentences  # never leave the caller with silence
             job.dropped_sentences = len(sentences) - len(kept)
+            if getattr(self._tts, "one_request_per_reply", False):
+                # Services with a tight request limit get the whole reply at once.
+                kept = [" ".join(kept)] if kept else []
             for sentence in kept:
                 await self._speak(job, sentence)
             if plan.kind == ANNOUNCE:
                 # Outcome just decided: the server asks, once, whether there is anything else.
-                await self._speak(job, ANYTHING_ELSE_QUESTION, count_chars=False)
+                await self._speak(job, self._lang.anything_else, count_chars=False)
         except asyncio.CancelledError:
             raise
         except (LLMError, TTSError) as exc:
@@ -759,6 +796,13 @@ class Agent:
         if job.committed and not job.cancelled:
             self._finalize(job)
 
+    def _note_model(self, reply: dict[str, Any]) -> None:
+        """Log, once per call, that replies are coming from the fallback model."""
+        model = reply.get("model")
+        if model and self.llm_fallback_model is None:
+            self.llm_fallback_model = str(model)
+            self._record({"type": "llm_fallback_model", "turn": self._turn_index, "model": str(model)})
+
     async def _speak(self, job: _Job, text: str, *, count_chars: bool = True) -> None:
         """Turn one sentence into audio (cached phrase or TTS) and route it."""
         job.sentences.append(text)
@@ -771,6 +815,23 @@ class Agent:
         if count_chars:
             self.tts_chars += len(text)
         started = self._now()
+        try:
+            await self._synthesize(job, text, started)
+        except TTSRateLimited as exc:
+            # Too many requests in a short time. Tell the caller we are still here,
+            # wait a moment and try exactly once more; a second refusal is an error.
+            wait_s = min(max(exc.retry_after_s, 0.0), MAX_RATE_LIMIT_WAIT_S)
+            self.tts_rate_limited += 1
+            self._record({"type": "tts_rate_limited", "retry_after_s": round(exc.retry_after_s, 1), "waiting_s": round(wait_s, 1)})
+            moment = self._phrases.cached(self._lang.one_moment)
+            if moment is not None:
+                self._emit(job, moment)
+            await asyncio.sleep(wait_s)
+            if job.cancelled:
+                return
+            await self._synthesize(job, text, started)
+
+    async def _synthesize(self, job: _Job, text: str, started: float) -> None:
         async for chunk in self._tts.stream(text):
             if job.tts_first_audio_ms is None:
                 job.tts_first_audio_ms = (self._now() - started) * 1000.0
@@ -899,9 +960,9 @@ class Agent:
             self.history.append({"role": "assistant", "content": " ".join(job.sentences)})
         if job.slots_after is not None:
             self._apply_state(job, announced=False)
-        audio = self._phrases.cached(APOLOGY_TEXT)
+        audio = self._phrases.cached(self._lang.apology)
         if audio:
-            self._say_fixed(APOLOGY_TEXT, audio, kind="apology")
+            self._say_fixed(self._lang.apology, audio, kind="apology")
 
     # ------------------------------------------------------------------ fixed phrases / endings
     def _say_fixed(self, text: str, audio: bytes, *, kind: str) -> None:
@@ -1058,8 +1119,10 @@ class Agent:
             "computed_outcome": self._outcome(),
             "slots": dict(self.slots),
             "replans": self.replans,
+            "turn_merges": self.turn_merges,
             "json_fallbacks": self.json_fallbacks,
             "llm_paths": dict(self.llm_paths),
+            "llm_fallback_model": self.llm_fallback_model,
             "errors": self.errors,
             "llm_requests": self.llm_usage.requests,
             "llm_tokens": self.llm_usage.total_tokens,
@@ -1067,4 +1130,5 @@ class Agent:
             "llm_completion_tokens": self.llm_usage.completion_tokens,
             "llm_cached_tokens": self.llm_usage.cached_tokens,
             "tts_chars": self.tts_chars,
+            "tts_rate_limited": self.tts_rate_limited,
         }

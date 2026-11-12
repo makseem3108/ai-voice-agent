@@ -115,9 +115,9 @@ def test_profile_can_override_model_and_voice(tmp_path: Path) -> None:
 
 
 def test_unknown_provider_or_unsupported_language_stops_at_start_up() -> None:
-    with pytest.raises(ProfileError, match=r"unknown stt provider 'whisper' \(available: flux\)"):
+    with pytest.raises(ProfileError, match=r"unknown stt provider 'whisper' \(available: flux, nova3\)"):
         check_providers(dataclasses.replace(PROFILE, stt=SttConfig(provider="whisper")))
-    with pytest.raises(ProfileError, match=r"unknown tts provider 'robot' \(available: aura\)"):
+    with pytest.raises(ProfileError, match=r"unknown tts provider 'robot' \(available: aura, azure\)"):
         check_providers(dataclasses.replace(PROFILE, tts=TtsConfig(provider="robot")))
     with pytest.raises(ProfileError) as info:
         check_providers(dataclasses.replace(PROFILE, language="he"))
@@ -125,7 +125,7 @@ def test_unknown_provider_or_unsupported_language_stops_at_start_up() -> None:
     assert "stt provider 'flux' does not support language 'he'" in message
     assert "tts provider 'aura' does not support language 'he'" in message
     check_providers(dataclasses.replace(PROFILE, language="en-US"))
-    assert set(STT_PROVIDERS) == {"flux"} and set(TTS_PROVIDERS) == {"aura"}
+    assert set(STT_PROVIDERS) == {"flux", "nova3"} and set(TTS_PROVIDERS) == {"aura", "azure"}
 
 
 def test_build_services_uses_the_factory(tmp_path: Path) -> None:

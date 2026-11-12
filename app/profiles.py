@@ -31,7 +31,7 @@ _TEXT_FIELDS = (
     "closing_qualified",
     "closing_not_fit",
 )
-_ALL_FIELDS = set(_TEXT_FIELDS) | {"slots", "outcomes", "max_call_seconds", "keyterms", "language", "stt", "tts"}
+_ALL_FIELDS = set(_TEXT_FIELDS) | {"slots", "outcomes", "max_call_seconds", "keyterms", "language", "stt", "tts", "speech_notes"}
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Z]{2})?$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _MAX_LEN = {"greeting": 400, "closing_qualified": 400, "closing_not_fit": 400, "knowledge": 6000}
@@ -49,7 +49,11 @@ class SttConfig:
 
     provider: str = ""  # adapter name, see app/providers.py
     model: str = ""
-    language: str = ""  # language code sent to the service, if it differs from the profile's
+    #: Language code sent to the service, if it differs from the profile's.
+    #: "multi" = let the model detect the language per sentence (mixed speech).
+    language: str = ""
+    #: Only with language "multi": the languages to expect, e.g. (ar, he).
+    language_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,8 @@ class Profile:
     language: str = "en"
     stt: SttConfig = SttConfig()
     tts: TtsConfig = TtsConfig()
+    #: Extra wording rule for the model, in English (e.g. words to prefer or avoid for the voice).
+    speech_notes: str = ""
 
 
 def validate_name(name: str) -> str:
@@ -146,7 +152,24 @@ def parse_profile(name: str, data: Any) -> Profile:
     if not isinstance(language, str) or not _LANGUAGE_RE.match(language):
         problems.append("'language' must be a language code such as en, he or ar-JO")
         language = "en"
-    stt_fields = _provider_section(data, "stt", ("provider", "model", "language"), problems)
+    speech_notes = data.get("speech_notes", "")
+    if not isinstance(speech_notes, str) or len(speech_notes) > 600:
+        problems.append("'speech_notes' must be text of at most 600 characters")
+        speech_notes = ""
+    stt_section = data.get("stt")
+    hints: tuple[str, ...] = ()
+    if isinstance(stt_section, dict) and "language_hints" in stt_section:
+        raw_hints = stt_section["language_hints"]
+        if not isinstance(raw_hints, list) or not raw_hints or any(not isinstance(h, str) or not _LANGUAGE_RE.match(h) for h in raw_hints):
+            problems.append("'stt.language_hints' must be a list of language codes, for example [ar, he]")
+        elif stt_section.get("language") != "multi":
+            problems.append("'stt.language_hints' only works with stt.language: multi")
+        else:
+            hints = tuple(dict.fromkeys(raw_hints))
+        data = {**data, "stt": {k: v for k, v in stt_section.items() if k != "language_hints"}}
+    stt_fields: dict[str, Any] = dict(_provider_section(data, "stt", ("provider", "model", "language"), problems))
+    if hints:
+        stt_fields["language_hints"] = hints
     tts_fields = _provider_section(data, "tts", ("provider", "voice"), problems)
 
     if problems:
@@ -160,6 +183,7 @@ def parse_profile(name: str, data: Any) -> Profile:
         language=language,
         stt=SttConfig(**stt_fields),
         tts=TtsConfig(**tts_fields),
+        speech_notes=" ".join(speech_notes.split()),
         **text,
     )
 

@@ -20,7 +20,7 @@ Everything here is service-neutral on purpose: no URLs, no API keys.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable, Optional, Protocol, Union, runtime_checkable
+from typing import Any, AsyncIterator, Callable, Optional, Protocol, Union, runtime_checkable
 
 # ---- turn events every STT adapter reports ---------------------------------
 START_OF_TURN = "StartOfTurn"  # the caller began speaking (used for barge-in)
@@ -41,6 +41,8 @@ class TurnEvent:
     audio_window_end: float = 0.0
     audio_window_start: float = 0.0
     last_word_end: Optional[float] = None
+    #: Adapter-specific diagnostics for the call log (e.g. what ended the turn).
+    details: Optional[dict[str, Any]] = None
 
     @property
     def speech_end(self) -> float:
@@ -70,6 +72,18 @@ SpeechEventHandler = Callable[[SpeechEvent, float], None]
 
 class TTSError(Exception):
     """Speech synthesis failed. Message is safe to log."""
+
+
+class TTSRateLimited(TTSError):
+    """The service (or our own limiter) refused the request: too many in a short time.
+
+    Nothing was synthesized. ``retry_after_s`` says how long until another
+    request can succeed; the agent says "one moment" and tries once more.
+    """
+
+    def __init__(self, message: str, retry_after_s: float) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 @runtime_checkable
@@ -119,6 +133,9 @@ class TTSProvider(Protocol):
     #: A URL worth touching every few seconds during a call to keep the HTTPS
     #: connection open, or None if the service should not be pinged.
     keep_warm_url: Optional[str]
+    #: Optional attribute ``one_request_per_reply`` (default False): True if the
+    #: agent should send a whole reply in one request instead of one per
+    #: sentence (services with a tight request limit).
 
     def stream(self, text: str) -> AsyncIterator[bytes]:
         """Yield audio for ``text`` as it is generated. Raises :class:`TTSError`.

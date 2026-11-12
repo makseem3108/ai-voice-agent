@@ -63,9 +63,17 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
     if kind == "barge_resume":
         return f"[barge_resume] STT did not confirm within {record.get('paused_ms', 0):.0f} ms; bot resumed"
     if kind == "stt_event":
+        details = record.get("details")
+        if record.get("event") == "EndOfTurn" and isinstance(details, dict):
+            # Nova-3: what ended the turn, and whether words were dropped between guess and final text
+            lost = details.get("lost_words") or []
+            return (
+                f"[stt_turn] ended_by={details.get('ended_by')} pieces={len(details.get('segments') or [])}"
+                + (f" words in the interim guess but not in the final text: {', '.join(lost)}" if lost else " no words lost between interim and final")
+            )
         if record.get("event") != "StartOfTurn":
             return None  # Update / Eager / EndOfTurn details are kept in the call file only
-        return f"[flux] StartOfTurn (audio {record.get('audio_end', 0):.2f}s, reported {record.get('lag_ms') or 0:.0f} ms after that audio arrived)"
+        return f"[stt] StartOfTurn (audio {record.get('audio_end', 0):.2f}s, reported {record.get('lag_ms') or 0:.0f} ms after that audio arrived)"
     if kind == "ending":
         return f"[ending] outcome={record.get('outcome')}; hanging up after {record.get('silence_s', 0):g}s of silence unless the caller speaks"
     if kind == "hangup_extended":
@@ -104,6 +112,28 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
         return (
             f"[rtp] {part('rx', 'phone->server')} | {part('tx', 'server->phone (reported by phone)')}"
             f" | round trip avg={ms('rtt_avg_ms')} worst={ms('rtt_max_ms')}"
+        )
+    if kind == "llm_fallback_model":
+        return (
+            f"[llm_fallback_model] the main model's daily token limit is used up; "
+            f"this call is answered by {record.get('model')}"
+        )
+    if kind == "turn_merge":
+        parts = record.get("parts") or ["", ""]
+        return (
+            f"[turn_merge] the caller went on speaking {record.get('gap_ms', 0):.0f} ms after the turn ended, before the reply "
+            f"was audible; answered as one turn: \"{parts[0]}\" + \"{parts[-1]}\""
+        )
+    if kind == "tts_rate_limited":
+        return (
+            f"[tts_rate_limited] text-to-speech asked us to slow down (retry after {record.get('retry_after_s', 0):g} s); "
+            f"said \"one moment\", retrying once in {record.get('waiting_s', 0):g} s"
+        )
+    if kind == "tts_usage":
+        return (
+            f"[tts_usage] {record.get('provider')}: this call {record.get('call_chars', 0)} characters; "
+            f"month {record.get('month')}: {record.get('month_chars', 0)} of {record.get('month_limit', 0)} characters, "
+            f"{record.get('month_requests', 0)} requests"
         )
     if kind == "llm_json_fallback":
         return "[llm_json_fallback] the model answered in plain text instead of JSON; the text was clean, so it was spoken (slots unchanged)"
