@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from .slots import OutcomeVariant, SlotDef, parse_outcomes, parse_slots
+from .slots import OutcomeVariant, SlotDef, parse_outcomes, parse_slots, template_problems
 
 DEFAULT_MAX_CALL_SECONDS = 300
 MIN_CALL_SECONDS = 30
@@ -31,7 +31,7 @@ _TEXT_FIELDS = (
     "closing_qualified",
     "closing_not_fit",
 )
-_ALL_FIELDS = set(_TEXT_FIELDS) | {"slots", "outcomes", "max_call_seconds", "keyterms", "language", "stt", "tts", "speech_notes"}
+_ALL_FIELDS = set(_TEXT_FIELDS) | {"slots", "outcomes", "max_call_seconds", "keyterms", "language", "stt", "tts", "speech_notes", "confirmation", "listening_notes"}
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Z]{2})?$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _MAX_LEN = {"greeting": 400, "closing_qualified": 400, "closing_not_fit": 400, "knowledge": 6000}
@@ -90,6 +90,14 @@ class Profile:
     tts: TtsConfig = TtsConfig()
     #: Extra wording rule for the model, in English (e.g. words to prefer or avoid for the voice).
     speech_notes: str = ""
+    #: What speech recognition tends to get wrong on this line, in English (e.g. words
+    #: from another language that arrive misspelled), so the model can read through it.
+    listening_notes: str = ""
+    #: What the bot says once everything has been collected, with ``{slot}``
+    #: placeholders and ``[optional parts]``. A fixed sentence filled in by code,
+    #: so the bot cannot promise a booking, a time or anything else the model
+    #: might make up. Empty = the model words that sentence (older profiles).
+    confirmation: str = ""
 
 
 def validate_name(name: str) -> str:
@@ -152,6 +160,15 @@ def parse_profile(name: str, data: Any) -> Profile:
     if not isinstance(language, str) or not _LANGUAGE_RE.match(language):
         problems.append("'language' must be a language code such as en, he or ar-JO")
         language = "en"
+    confirmation = data.get("confirmation", "")
+    if not isinstance(confirmation, str) or len(confirmation) > 400:
+        problems.append("'confirmation' must be text of at most 400 characters")
+        confirmation = ""
+    problems += template_problems(confirmation, slots, "'confirmation'")
+    listening_notes = data.get("listening_notes", "")
+    if not isinstance(listening_notes, str) or len(listening_notes) > 800:
+        problems.append("'listening_notes' must be text of at most 800 characters")
+        listening_notes = ""
     speech_notes = data.get("speech_notes", "")
     if not isinstance(speech_notes, str) or len(speech_notes) > 600:
         problems.append("'speech_notes' must be text of at most 600 characters")
@@ -184,6 +201,8 @@ def parse_profile(name: str, data: Any) -> Profile:
         stt=SttConfig(**stt_fields),
         tts=TtsConfig(**tts_fields),
         speech_notes=" ".join(speech_notes.split()),
+        confirmation=" ".join(confirmation.split()),
+        listening_notes=" ".join(listening_notes.split()),
         **text,
     )
 

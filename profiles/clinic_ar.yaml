@@ -1,9 +1,12 @@
 # Fictional business - demo profile. Arabic (Levantine) version of clinic.yaml (same slots).
 language: ar
 stt:
-  provider: nova3
-  language: multi          # callers mix Arabic with Hebrew words; the model picks the language per sentence
-  language_hints: [ar, he]
+  provider: nova3          # Arabic only (language taken from `language`): it can only write Arabic
+  # For callers who mix in Hebrew words, the alternative is detection per sentence:
+  #   language: multi
+  #   language_hints: [ar, he]
+  # On the first real call (2026-11-12) that mode turned short Arabic answers into
+  # English and Persian words, so it is not the default. See docs/backlog.md.
 tts:
   provider: azure
   voice: ar-JO-SanaNeural
@@ -16,6 +19,14 @@ speech_notes: >
   (e.g. ممكن instead of بقدر, نمرة تلفونك instead of رقم تليفونك, ساعة instead of وقت where natural).
   This is not absolute: keep a word with ق only when there is no natural alternative.
   Keep sentences short.
+# What speech recognition gets wrong on this line, for the model (see docs/backlog.md).
+listening_notes: >
+  Callers mix Hebrew words into their Arabic, and speech recognition writes them in
+  Arabic letters, often misspelled. Near "احجز" (book), a word like تور, ستور, اتور, طول or
+  صوره most likely means תור (an appointment), not a picture or an x-ray. هفنياه or
+  افنياه means a referral from a doctor. كوبات حوليم (also كلاليت, مكابي, مئوحيدت,
+  لئوميت) is the caller's health fund. بسيدر means "okay". None of these make a
+  request non-dental.
 business_name: عيادة الشفاء لطب الأسنان
 agent_role: the front desk assistant who handles appointment requests
 goal: >
@@ -28,10 +39,14 @@ slots:
     type: yes_no
     required: false
     description: >
-      no only if the caller clearly needs something a general dentist does not do
-      (for example braces, surgery in hospital, or a non-dental problem). Otherwise leave it empty or yes.
+      This is a dental clinic. Set no when the caller asks for anything that is not
+      general dentistry: something that has nothing to do with a clinic at all (shopping,
+      food, another business, a wrong number, general chat), another kind of doctor or service (a family doctor, an eye exam,
+      a skin or ear problem, blood tests, a prescription), or dental work we do not do
+      (braces, surgery in hospital). Set yes for teeth, gums, check-ups, cleaning, tooth pain.
+      Leave it empty only if the caller has not said yet what they need.
     disqualifying: ["no"]
-    not_fit_reason: we are a general dentistry practice and do not offer that treatment
+    not_fit_reason: this is a dental clinic - we only do general dentistry and do not offer that service
   - name: reason
     type: text
     question: شو سبب الزيارة؟ مثلاً فحص، تنظيف، أو وجع أسنان.
@@ -47,7 +62,7 @@ slots:
     type: text
     question: شو الاسم الكامل لو سمحت؟
   - name: phone
-    type: text
+    type: phone
     question: على أي نمرة نتصل فيك لنأكّد الموعد؟
 
 knowledge: |
@@ -56,15 +71,31 @@ knowledge: |
   عنا فحص، تنظيف أسنان، حشوات، تيجان وتبييض.
   الفحص مع التنظيف بياخد حوالي خمسة وأربعين دقيقة.
   المرضى الجداد لازم ييجوا عشر دقايق بدري لتعبئة نموذج.
+  شو تجيب معك: الهوية وكرت الكوبات حوليم، وإذا عندك صور أشعة جديدة، جيبها معك.
   المساعدة بتسجل الطلب بس؛ العيادة بتتصل لتأكيد الساعة بالزبط.
   إذا في وجع شديد، ورم أو نزيف، في مواعيد طارئة بنفس اليوم بأيام الدوام.
   ما بنعطي نصايح طبية أو تشخيص عالتلفون.
   للعلاجات اللي مش عنا، دكتور العيلة أو دكتور مختص بيحولك.
 tone: calm, kind and reassuring
+# Said by the code once everything is collected: a fixed sentence filled in from
+# the slots ([...] is dropped if that slot is empty). The model does not word it,
+# so it cannot promise a booking, a time or instructions.
+confirmation: "تمام، سجّلت طلبك[، والموعد اللي طلبته: {preferred_time}]. رح نتصل فيك من العيادة لنأكّد الموعد."
 # Said when an appointment request has been taken.
 closing_qualified: شكراً إلك. رح نتصل فيك من العيادة لتأكيد الموعد. مع السلامة!
 # Said when we cannot help (for example something we do not treat). No promises here.
 closing_not_fit: آسفة، هاد الإشي ما بنعمله عنا. شكراً لاتصالك بعيادة الشفاء، ومع السلامة!
+# No phone number (the caller would rather not give one, or it never came through
+# complete): the request is noted, but nobody can call back - the caller is told so.
+outcomes:
+  qualified_no_callback:
+    when:
+      phone: unclear
+    announce: >
+      We have no phone number for the caller. Say their request is noted.
+      Do not promise that anyone will call or contact them.
+    confirmation: "تمام، سجّلت طلبك[، والموعد اللي طلبته: {preferred_time}]."
+    closing: تمام، سجّلت طلبك. بس ما عنا نمرة إلك، فإذا بتحب، اتصل فينا مرة تانية لنأكّد الموعد. مع السلامة!
 max_call_seconds: 300
 # Words speech recognition should listen for.
 keyterms:
@@ -77,7 +108,13 @@ keyterms:
   - وجع أسنان
   - ورم
   - نزيف
-  - طوارئ
+  # (طوارئ is left out on purpose: as a keyterm it turned תור into "طوارئ", an emergency.)
   - مريض جديد
   - دكتور أسنان
   - عيادة الشفاء
+  # Hebrew words callers use, written the way speech recognition should spell them.
+  # (تور is left out on purpose: as a keyterm it broke "دكتور" apart.)
+  - كوبات حوليم
+  - كلاليت
+  - هفنياه
+  - الدوام

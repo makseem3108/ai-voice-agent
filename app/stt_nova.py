@@ -92,6 +92,7 @@ class NovaTurnTracker:
         self._finals: list[str] = []
         self._segments: list[dict[str, Any]] = []
         self._interim = ""  # latest guess for the slice not yet finalized
+        self._languages: list[str] = []  # detected languages of this turn (multi mode only)
         self._window_start = 0.0
         self._window_end = 0.0
         self._last_word_end: Optional[float] = None
@@ -124,12 +125,17 @@ class NovaTurnTracker:
             # marks it as already finalized (-1), it must not end the new turn.
             if event.last_word_end < 0 or event.last_word_end <= self._window_start:
                 return []
+            if self._interim:
+                # Words are still arriving (there is a guess that is not final yet): the
+                # caller only paused inside a sentence. Our own timeout remains the backup.
+                return []
             return self._end(ENDED_BY_UTTERANCE_END)
         if not isinstance(event, Transcript):
             return []
         out: list[TurnEvent] = []
         text = event.text.strip()
         if text:
+            self._languages += [code for code in event.languages if code not in self._languages]
             if not self._open:
                 self._open = True
                 self._window_start = event.start
@@ -168,11 +174,13 @@ class NovaTurnTracker:
             if segment["final"] is not None and segment["interim"]:
                 lost += [w for w in _words(segment["interim"]) if _is_lost(w, final_words) and w not in lost]
         details = {"ended_by": ended_by, "segments": self._segments, "lost_words": lost}
+        if self._languages:
+            details["languages"] = self._languages
         confidence = 1.0 if ended_by == ENDED_BY_SPEECH_FINAL else 0.5
         events = [self._event(END_OF_TURN, text, confidence, details)] if text else []
         self.turn_index += 1
         self._open = False
-        self._finals, self._segments = [], []
+        self._finals, self._segments, self._languages = [], [], []
         self._last_word_end = None
         return events
 

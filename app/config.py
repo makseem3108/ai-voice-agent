@@ -85,6 +85,8 @@ class Settings:
 
     #: Debug only: save the caller's audio per call. Files are deleted after 7 days.
     debug_record_audio: bool = False
+    #: Record only the lines with these profiles (e.g. ``clinic_ar``). Empty = every line.
+    debug_record_profiles: tuple[str, ...] = ()
     recordings_dir: Path = PROJECT_ROOT / "data" / "recordings"
     #: Where Asterisk leaves per-call RTP statistics at hang-up (see asterisk/extensions.conf).
     rtp_stats_dir: Path = Path("/var/lib/voice-agent-rtp")
@@ -101,6 +103,12 @@ class Settings:
     @property
     def stt_active(self) -> bool:
         return self.stt_enabled and bool(self.deepgram_api_key)
+
+    def records_audio(self, profile: str | None) -> bool:
+        """Is caller audio recorded on the line that runs ``profile``?"""
+        if not self.debug_record_audio:
+            return False
+        return not self.debug_record_profiles or (profile or "") in self.debug_record_profiles
 
     @property
     def agent_active(self) -> bool:
@@ -227,6 +235,7 @@ def load_settings(
         end_silence_ms=_int(values, "END_SILENCE_MS", 1500, 0, 15000),
         end_silence_max_ms=_int(values, "END_SILENCE_MAX_MS", 3000, 0, 15000),
         debug_record_audio=_bool(values, "DEBUG_RECORD_AUDIO", False),
+        debug_record_profiles=tuple(p.strip() for p in (values.get("DEBUG_RECORD_PROFILES") or "").split(",") if p.strip()),
         recordings_dir=Path(values["RECORDINGS_DIR"]) if values.get("RECORDINGS_DIR") else PROJECT_ROOT / "data" / "recordings",
         rtp_stats_dir=Path(values.get("RTP_STATS_DIR") or "/var/lib/voice-agent-rtp"),
         calls_dir=Path(calls_dir) if calls_dir else PROJECT_ROOT / "data" / "calls",

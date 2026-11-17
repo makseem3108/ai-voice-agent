@@ -17,10 +17,14 @@ slots:
     type: yes_no
     required: false
     description: >
-      no only if the caller clearly needs something a general dentist does not do
-      (for example braces, surgery in hospital, or a non-dental problem). Otherwise leave it empty or yes.
+      This is a dental clinic. Set no when the caller asks for anything that is not
+      general dentistry: something that has nothing to do with a clinic at all (shopping,
+      food, another business, a wrong number, general chat), another kind of doctor or service (a family doctor, an eye exam,
+      a skin or ear problem, blood tests, a prescription), or dental work we do not do
+      (braces, surgery in hospital). Set yes for teeth, gums, check-ups, cleaning, tooth pain.
+      Leave it empty only if the caller has not said yet what they need.
     disqualifying: ["no"]
-    not_fit_reason: we are a general dentistry practice and do not offer that treatment
+    not_fit_reason: this is a dental clinic - we only do general dentistry and do not offer that service
   - name: reason
     type: text
     question: מה סיבת הביקור? למשל בדיקה, ניקוי או כאב שיניים.
@@ -36,7 +40,7 @@ slots:
     type: text
     question: מה השם המלא?
   - name: phone
-    type: text
+    type: phone
     question: לאיזה מספר טלפון לחזור כדי לאשר את התור?
 
 knowledge: |
@@ -45,15 +49,31 @@ knowledge: |
   אנחנו מציעים בדיקות, ניקוי שיניים, סתימות, כתרים והלבנה.
   בדיקה עם ניקוי נמשכת כארבעים וחמש דקות.
   מטופלים חדשים מתבקשים להגיע עשר דקות לפני התור כדי למלא טופס.
+  מה להביא: תעודת זהות וכרטיס קופת חולים, ואם יש צילומי רנטגן עדכניים – להביא אותם.
   העוזרת רק רושמת בקשה; המזכירות מאשרת את השעה המדויקת בטלפון.
   במקרה של כאב חזק, נפיחות או דימום יש תורים דחופים באותו יום, בימי חול.
   איננו נותנים ייעוץ רפואי או אבחנות בטלפון.
   לטיפולים שאיננו מציעים, רופא המשפחה או רופא מומחה יכולים לתת הפניה.
 tone: calm, kind and reassuring
+# Said by the code once everything is collected: a fixed sentence filled in from
+# the slots ([...] is dropped if that slot is empty). The model does not word it,
+# so it cannot promise a booking, a time or instructions.
+confirmation: "תודה. רשמתי את הבקשה[, למועד שביקשתם: {preferred_time}]. המזכירות תחזור אליכם כדי לאשר את התור."
 # Said when an appointment request has been taken.
 closing_qualified: תודה. המזכירות תחזור אליכם לאישור התור. יום טוב!
 # Said when we cannot help (for example something we do not treat). No promises here.
 closing_not_fit: מצטערת, בזה לא נוכל לעזור כאן. תודה שהתקשרתם למרפאת השיניים הרבור, ויום טוב!
+# No phone number (the caller would rather not give one, or it never came through
+# complete): the request is noted, but nobody can call back - the caller is told so.
+outcomes:
+  qualified_no_callback:
+    when:
+      phone: unclear
+    announce: >
+      We have no phone number for the caller. Say their request is noted.
+      Do not promise that anyone will call or contact them.
+    confirmation: "תודה. רשמתי את הבקשה[, למועד שביקשתם: {preferred_time}]."
+    closing: רשמתי את הבקשה. מכיוון שלא השארתם מספר, אפשר להתקשר אלינו שוב כדי לאשר את התור. יום טוב!
 max_call_seconds: 300
 # Words speech recognition should listen for.
 keyterms:

@@ -25,12 +25,17 @@ from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 from .amounts import parse_amount
+from .phones import phone_value
 
-SLOT_TYPES = ("yes_no", "choice", "text", "number", "money")
+SLOT_TYPES = ("yes_no", "choice", "text", "number", "money", "phone")
 OUTCOME_QUALIFIED = "qualified"
 OUTCOME_NOT_FIT = "not_fit"
 #: The caller ended the call before we knew either way.
 OUTCOME_INCOMPLETE = "incomplete"
+#: We could not understand an answer that decides the outcome; a person will call back.
+OUTCOME_CALLBACK = "callback"
+#: Stored by the code (never by the model) for a slot it gave up asking about.
+UNCLEAR = "unclear"
 
 MAX_TEXT_CHARS = 120
 MAX_SLOTS = 12
@@ -39,7 +44,7 @@ _UNKNOWN = {"", "unknown", "n/a", "na", "none", "null", "not sure", "unsure", "n
 _NUMBER_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
 
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
-RESERVED_OUTCOMES = (OUTCOME_QUALIFIED, OUTCOME_NOT_FIT, OUTCOME_INCOMPLETE)
+RESERVED_OUTCOMES = (OUTCOME_QUALIFIED, OUTCOME_NOT_FIT, OUTCOME_INCOMPLETE, OUTCOME_CALLBACK)
 
 #: Text, a number, or for "money" slots ``{"text": ..., "amount": ..., "currency": ...}``.
 SlotValue = Union[str, int, float, dict[str, Any]]
@@ -183,6 +188,10 @@ def normalise_value(slot: SlotDef, raw: Any) -> Optional[SlotValue]:
         if isinstance(raw, dict):  # an already stored value
             raw = raw.get("text")
         return money_value(slot, raw)
+    if slot.type == "phone":
+        if isinstance(raw, dict):
+            raw = raw.get("text")
+        return phone_value(raw)
     if raw is None or isinstance(raw, (list, dict)):
         return None
     if slot.type == "number":
@@ -232,6 +241,8 @@ def money_value(slot: SlotDef, text: Any) -> Optional[dict[str, Any]]:
 
 def display_value(value: Any) -> str:
     """One slot value as short text for logs."""
+    if isinstance(value, dict) and "valid" in value:
+        return f"{value.get('number') or value.get('text')}" + ("" if value.get("valid") else " (not a complete number)")
     if isinstance(value, dict):
         if value.get("amount") is not None:
             return f"{value['amount']} {value.get('currency') or '?'} (\"{value.get('text')}\")"
@@ -297,6 +308,8 @@ class OutcomeVariant:
     announce: str
     #: The fixed closing line for this outcome.
     closing: str
+    #: Optional fixed sentence said when this outcome is reached (see Profile.confirmation).
+    confirmation: str = ""
 
     def matches(self, slots: dict[str, Optional[SlotValue]]) -> bool:
         return all(slots.get(name) == value for name, value in self.when)
@@ -322,7 +335,7 @@ def parse_outcomes(data: Any, defs: tuple[SlotDef, ...]) -> tuple[tuple[OutcomeV
         if not isinstance(raw, dict):
             problems.append(f"{where} must be a mapping with 'when', 'announce' and 'closing'")
             continue
-        unknown = sorted(str(k) for k in raw if k not in ("when", "announce", "closing"))
+        unknown = sorted(str(k) for k in raw if k not in ("when", "announce", "closing", "confirmation"))
         if unknown:
             problems.append(f"{where}: unknown field(s): {', '.join(unknown)}")
         when = raw.get("when")
@@ -337,6 +350,9 @@ def parse_outcomes(data: Any, defs: tuple[SlotDef, ...]) -> tuple[tuple[OutcomeV
                 clean = str(value).strip().lower()
                 if slot is None:
                     problems.append(f"{where}: 'when' refers to unknown slot '{slot_name}'")
+                elif clean == UNCLEAR and not slot.disqualifying:
+                    # "we stopped asking for it": the caller would rather not say, or it never came through
+                    conditions.append((slot.name, UNCLEAR))
                 elif slot.allowed is None:
                     problems.append(f"{where}: 'when' needs a 'yes_no' or 'choice' slot, and '{slot_name}' is neither")
                 elif clean not in slot.allowed:
@@ -354,14 +370,22 @@ def parse_outcomes(data: Any, defs: tuple[SlotDef, ...]) -> tuple[tuple[OutcomeV
                 problems.append(f"{where}: '{key}' is too long ({len(value)} > {limit} characters)")
             else:
                 texts[key] = " ".join(value.split())
+        confirmation = raw.get("confirmation", "")
+        if not isinstance(confirmation, str) or len(confirmation) > 400:
+            problems.append(f"{where}: 'confirmation' must be text of at most 400 characters")
+            confirmation = ""
+        problems += template_problems(confirmation, defs, where)
         if conditions and len(texts) == 2:
-            variants.append(OutcomeVariant(name, tuple(conditions), texts["announce"], texts["closing"]))
+            variants.append(
+                OutcomeVariant(name, tuple(conditions), texts["announce"], texts["closing"], " ".join(confirmation.split()))
+            )
     return tuple(variants), problems
 
 
 def affects_outcome(slot: SlotDef, variants: tuple[OutcomeVariant, ...] = ()) -> bool:
     """Can this slot's value change whether (or how) the caller qualifies?"""
-    return bool(slot.disqualifying) or any(name == slot.name for variant in variants for name, _ in variant.when)
+    # A variant for "we stopped asking" (value unclear) does not make the slot one we must have.
+    return bool(slot.disqualifying) or any(name == slot.name and value != UNCLEAR for variant in variants for name, value in variant.when)
 
 
 def compute_outcome(
@@ -383,6 +407,7 @@ COLLECT = "collect"  # ask for the next missing slot
 ANNOUNCE = "announce"  # outcome just decided: tell the caller, then ask "anything else?"
 ANSWER = "answer"  # outcome already announced: just answer; the caller ends the call
 FINAL = "final"  # the caller said goodbye: extract what they said, say nothing; code closes the call
+CONFIRM = "confirm"  # it sounds like we cannot help: check we understood before saying so
 
 
 @dataclass(frozen=True)
@@ -395,6 +420,12 @@ class Plan:
     next: Optional[SlotDef] = None  # collect: the slot to ask if `target` gets answered
     reason: Optional[SlotDef] = None  # announce not_fit: the slot that rules the caller out
     note: Optional[str] = None  # announce a qualified variant: what to tell the caller
+    #: collect: which time this slot is being asked for (1 = first). Set by the agent's loop guard.
+    attempt: int = 1
+    #: collect a phone slot: the number that was heard, to be read back to the caller.
+    heard: Optional[str] = None
+    #: ... and whether that number is complete (then: "is that right?") or a digit is missing.
+    heard_complete: bool = False
 
 
 def make_plan(
@@ -460,3 +491,54 @@ def reply_schema(defs: tuple[SlotDef, ...]) -> dict[str, Any]:
             "say": {"type": "string"},
         },
     }
+
+
+# --------------------------------------------------------------------------- confirmation template
+_OPTIONAL_PART_RE = re.compile(r"\[([^\[\]]*)\]")
+_PLACEHOLDER_RE = re.compile(r"\{([a-z][a-z0-9_]*)\}")
+
+
+def slot_text(value: Any) -> Optional[str]:
+    """What a slot value looks like in a sentence, or None if there is nothing usable."""
+    if value is None or value == UNCLEAR:
+        return None
+    if isinstance(value, dict):
+        text = value.get("text")
+        return str(text) if text else None
+    return str(value)
+
+
+def render_template(template: str, slots: dict[str, Optional[SlotValue]]) -> str:
+    """Fill ``{slot}`` placeholders from the slots. Used for what the bot says once a
+    request is complete, so that nothing in that sentence is made up by the model.
+
+    A part in square brackets is optional: it is dropped when one of its slots
+    has no usable value - ``"Noted[ for {preferred_time}]."`` becomes
+    ``"Noted."``. Outside brackets a missing value simply leaves no text.
+    """
+
+    def fill(text: str) -> tuple[str, bool]:
+        complete = True
+
+        def one(match: "re.Match[str]") -> str:
+            nonlocal complete
+            value = slot_text(slots.get(match.group(1)))
+            if value is None:
+                complete = False
+                return ""
+            return value
+
+        return _PLACEHOLDER_RE.sub(one, text), complete
+
+    def optional(match: "re.Match[str]") -> str:
+        text, complete = fill(match.group(1))
+        return text if complete else ""
+
+    text, _ = fill(_OPTIONAL_PART_RE.sub(optional, template))
+    return " ".join(text.split())
+
+
+def template_problems(template: str, defs: tuple[SlotDef, ...], where: str) -> list[str]:
+    names = {slot.name for slot in defs}
+    unknown = sorted({name for name in _PLACEHOLDER_RE.findall(template) if name not in names})
+    return [f"{where}: unknown slot(s) in the text: {', '.join(unknown)}"] if unknown else []

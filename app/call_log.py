@@ -29,6 +29,14 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
         latency = record.get("latency_ms")
         suffix = "" if latency is None else f"  (stt latency {latency:.0f} ms)"
         return f"[final]   {record['text']}{suffix}"
+    if kind == "correction":
+        how = "the model flagged it ([UPDATE]), turn redone as JSON" if record.get("marker") else "a number was said, JSON turn"
+        changed = ", ".join(record.get("slots") or []) or "nothing changed"
+        if record.get("pending"):
+            changed = f"{', '.join(record['pending'])} read back, NOT CONFIRMED YET - the old number stays until the caller says yes"
+        elif record.get("unconfirmed"):
+            changed = f"{', '.join(record['unconfirmed'])} UNCONFIRMED - the old number was kept"
+        return f"[correction] after the outcome ({how}): {changed}"
     if kind == "speech_end":
         return f"[speech_end] after {record['silence_s']:.2f}s silence"
     if kind == "utterance_end":
@@ -61,7 +69,11 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
     if kind == "barge_pause":
         return f"[barge_pause] caller voice detected locally (rms={record.get('rms', 0):.0f}); bot paused, waiting for STT to confirm"
     if kind == "barge_resume":
-        return f"[barge_resume] STT did not confirm within {record.get('paused_ms', 0):.0f} ms; bot resumed"
+        how = {
+            "dropped": "less than a second of the sentence was left, so it was dropped",
+            "restarted": "the sentence was said again from its beginning",
+        }.get(str(record.get("action")), "bot resumed")
+        return f"[barge_resume] STT did not confirm within {record.get('paused_ms', 0):.0f} ms; {how}"
     if kind == "stt_event":
         details = record.get("details")
         if record.get("event") == "EndOfTurn" and isinstance(details, dict):
@@ -69,6 +81,7 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
             lost = details.get("lost_words") or []
             return (
                 f"[stt_turn] ended_by={details.get('ended_by')} pieces={len(details.get('segments') or [])}"
+                + (f" detected={'+'.join(details['languages'])}" if details.get("languages") else "")
                 + (f" words in the interim guess but not in the final text: {', '.join(lost)}" if lost else " no words lost between interim and final")
             )
         if record.get("event") != "StartOfTurn":
@@ -113,7 +126,34 @@ def format_record(record: dict[str, Any]) -> Optional[str]:
             f"[rtp] {part('rx', 'phone->server')} | {part('tx', 'server->phone (reported by phone)')}"
             f" | round trip avg={ms('rtt_avg_ms')} worst={ms('rtt_max_ms')}"
         )
+    if kind == "loop_guard":
+        what = {
+            "rephrase": "asked a second time: rephrasing with the possible answers",
+            "skip": "still unanswered the third time: marked unclear, moving on",
+            "callback": "still unanswered the third time and nothing to go on without it: closing with a call-back",
+            "reworded": "asked a second time: the model's own new wording was kept",
+            "declined": "the caller would rather not say: marked unclear, moving on",
+            "redirect": "nothing learned yet: said what this business is and asked if that is what they need",
+            "off_topic": "still nothing about what we do after that: closing as not a fit",
+        }.get(str(record.get("action")), str(record.get("action")))
+        return f"[loop_guard] {record.get('slot')}: {what}"
+    if kind == "unintelligible":
+        return f"[unintelligible] speech recognition returned text that is not in this line's language: \"{record.get('text')}\"; not sent to the model"
+    if kind == "phone_readback":
+        if record.get("complete") is False:
+            return f"[phone_readback] {record.get('slot')}: heard \"{record.get('heard')}\", which is not a whole number; asked for it again (digits not read back)"
+        return f"[phone_readback] {record.get('slot')}: read \"{record.get('heard')}\" back to the caller to confirm it"
+    if kind == "scope_check":
+        return f"[scope_check] {record.get('slot')}: it sounded like something we do not offer; asked the caller to confirm before saying so"
+    if kind == "phone_rejected":
+        return f"[phone_rejected] {record.get('slot')}: the caller said no to the number read back; it was not stored"
+    if kind == "phone_gave_up":
+        return f"[phone_gave_up] \"{record.get('heard')}\" came after {record.get('readbacks')} read-backs without a yes: not read back again, not stored"
+    if kind == "phone_invalid":
+        return f"[phone_invalid] \"{record.get('heard')}\" is still not a phone number: not stored"
     if kind == "llm_fallback_model":
+        if record.get("reason") == "minute":
+            return f"[llm_fallback_model] the main model's per-minute token limit was reached; {record.get('model')} answered this request"
         return (
             f"[llm_fallback_model] the main model's daily token limit is used up; "
             f"this call is answered by {record.get('model')}"

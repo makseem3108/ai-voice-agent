@@ -57,6 +57,7 @@ class FakeLLM:
         self.requests: list[list[dict[str, str]]] = []
         self.schemas: list[dict[str, Any]] = []
         self.text_fallback: list[bool] = []
+        self.plain: list[bool] = []  # per request: was it asked as plain text (no schema)?
         self.cancelled = 0
         self.hold: Optional[asyncio.Event] = None  # when set: the request hangs until released
 
@@ -69,6 +70,7 @@ class FakeLLM:
         text_fallback: bool = True,
     ) -> dict[str, Any]:
         self.requests.append(messages)
+        self.plain.append(False)
         self.text_fallback.append(text_fallback)
         self.schemas.append(schema)
         if usage is not None:
@@ -86,6 +88,30 @@ class FakeLLM:
         if isinstance(item, BaseException):
             raise item
         return reply(item) if isinstance(item, str) else item
+
+    async def reply_text(self, messages: list[dict[str, str]], usage: Optional[LLMUsage] = None) -> dict[str, Any]:
+        """A plain-text turn: the next scripted reply, reduced to its sentence."""
+        self.requests.append(messages)
+        self.plain.append(True)
+        if usage is not None:
+            usage.requests += 1
+            usage.prompt_tokens += 100
+            usage.completion_tokens += 10
+        item = self.replies.pop(0) if self.replies else "We open at eight."
+        try:
+            if self.hold is not None:
+                await self.hold.wait()
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        if isinstance(item, BaseException):
+            raise item
+        say = item if isinstance(item, str) else str(item.get("say") or "")
+        out = {"say": say, "path": "plain"}
+        if isinstance(item, dict) and "model" in item:
+            out["model"] = item["model"]
+        return out
 
     def directive(self, index: int = -1) -> str:
         """The per-turn instruction the code gave the model in request ``index``."""
@@ -158,6 +184,7 @@ class Rig:
         end_silence_max_s: float = 1.0,
         end_hold_max_s: float = 1.0,
         merge_turns: bool = False,
+        loop_guard: bool = False,  # most tests script non-answers on purpose; guard tests switch it on
     ) -> None:
         self.llm = llm or FakeLLM()
         self.tts = tts or FakeTTS()
@@ -187,6 +214,7 @@ class Rig:
             end_silence_max_s=end_silence_max_s,
             end_hold_max_s=end_hold_max_s,
             merge_turns=merge_turns,
+            loop_guard=loop_guard,
         )
 
     def event(self, kind: str, text: str = "", end: float = 5.0) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ JSON_REPLY_MAX_TOKENS = 400
 PATH_JSON = "json"
 PATH_FUNCTION = "function_call"
 PATH_TEXT = "text_fallback"
+#: A turn that was asked for plain sentences in the first place (no JSON, no slots).
+PATH_PLAIN = "plain"
 
 
 class LLMError(Exception):
@@ -152,6 +155,28 @@ def is_daily_limit(detail: object) -> bool:
     return "per day" in text or "(tpd)" in text
 
 
+#: Longest pause we take, inside a call, to wait out the per-minute token limit.
+MAX_MINUTE_LIMIT_WAIT_S = 3.0
+
+
+_USED_RE = re.compile(r"\bused:?\s*(\d+)", re.IGNORECASE)
+
+
+def tokens_used(detail: object) -> Optional[int]:
+    """The "Used 199211" figure Groq puts in a daily-limit message; None if it names none."""
+    match = _USED_RE.search(str(detail))
+    return int(match.group(1)) if match else None
+
+
+def exact_wait_seconds(detail: object) -> Optional[float]:
+    """The wait Groq names in a rate-limit message, unrounded; None if it names none."""
+    match = _TRY_AGAIN_RE.search(str(detail))
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (float(g) if g else 0.0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def retry_after_seconds(detail: object, default: float = 600.0) -> float:
     """How long Groq says to wait ("Please try again in 5m55.104s"), within sane bounds."""
     match = _TRY_AGAIN_RE.search(str(detail))
@@ -197,12 +222,12 @@ class TokenLedger:
         oldest = self._hour(self._now() - 24 * 3600)
         return {hour: models for hour, models in buckets.items() if hour > oldest}
 
-    def add(self, model: str, tokens: int) -> None:
+    def add(self, model: str, tokens: int, requests: int = 1) -> None:
         """One answered request used ``tokens`` tokens. Never raises."""
         buckets = self._recent(self._load())
         entry = buckets.setdefault(self._hour(self._now()), {}).setdefault(model, [0, 0])
         entry[0] += max(0, int(tokens))
-        entry[1] += 1
+        entry[1] += requests
         self._memory = buckets
         if self._path is None:
             return
@@ -225,6 +250,19 @@ class TokenLedger:
                 entry["tokens"] += tokens
                 entry["requests"] += requests
         return totals
+
+    def correct(self, model: str, used: int) -> int:
+        """Groq says ``used`` tokens of the model's day are gone. If that is more than we
+        counted (requests made before this file existed, or by something else), add the
+        difference now, so the total shown is no longer too low. Returns what was added.
+        The extra tokens leave our count 24 hours from now - later than they really do,
+        so the count errs on the careful side."""
+        counted = self.last_24h().get(model, {}).get("tokens", 0)
+        missing = int(used) - counted
+        if missing <= 0:
+            return 0
+        self.add(model, missing, requests=0)
+        return missing
 
     def block(self, model: str, seconds: float) -> None:
         self.blocked_until[model] = self._now() + seconds
@@ -252,6 +290,7 @@ class GroqLLM:
         self.fallback_model = fallback_model if fallback_model and fallback_model != model else None
         self.ledger = ledger if ledger is not None else TokenLedger()
         self.model_fallbacks = 0
+        self.minute_limit_waits = 0
         self._max_tokens = max_tokens
         self._temperature = temperature
         self.budget = TokenBudget()
@@ -393,10 +432,58 @@ class GroqLLM:
             return self._tag({"say": plain_text, "path": PATH_TEXT}, model)
         raise LLMError(f"no usable reply after retry ({problem})")
 
+    async def reply_text(self, messages: list[dict[str, str]], usage: Optional[LLMUsage] = None) -> dict[str, Any]:
+        """One reply as plain sentences: ``{"say": "...", "path": "plain"}``, never any slots.
+
+        For turns after the outcome was announced. Nothing is extracted there, so
+        no JSON is asked for: no schema is sent and there is nothing for Groq to
+        reject ("Failed to generate JSON"), so the turn always costs one request.
+        The model has been writing JSON all call long and may do so again out of
+        habit; then the "say" inside it is used.
+        """
+        response, model = await self._post(messages, {}, usage)
+        if response.status_code != 200:
+            try:
+                detail = response.json()["error"]["message"]
+            except Exception:
+                detail = response.text[:200]
+            if response.status_code == 429:
+                self.budget.exhausted()
+            raise LLMError(f"Groq HTTP {response.status_code}: {_safe(detail)}")
+        try:
+            data = response.json()
+            self._count(data.get("usage"), usage, model)
+            content = data["choices"][0]["message"].get("content")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            raise LLMError("the reply could not be read") from None
+        text = content.strip() if isinstance(content, str) else ""
+        if "{" in text:
+            # JSON out of habit, with or without "slots": only its sentence is of use.
+            original, text = text, ""
+            try:
+                wrapped = json.loads(original)
+                if isinstance(wrapped, dict) and isinstance(wrapped.get("say"), str):
+                    text = wrapped["say"].strip()
+            except ValueError:
+                pass
+            if not text:
+                log.warning("plain reply was unusable JSON: %r", " ".join(original.split())[:160])
+        elif not text:
+            try:
+                why = data["choices"][0].get("finish_reason")
+            except (KeyError, IndexError, TypeError, AttributeError):
+                why = None
+            log.warning("plain reply was empty (finish_reason=%s)", why)
+        if not text:
+            raise LLMError("the model returned no plain-text reply")
+        return self._tag({"say": text, "path": PATH_PLAIN}, model)
+
     def _tag(self, reply: dict[str, Any], model: str) -> dict[str, Any]:
         """Note on the reply when it did not come from the main model."""
         if model != self.model:
             reply["model"] = model
+            # Why not the main model: refused for the day, or only over this minute's limit.
+            reply["model_reason"] = "daily" if self.ledger.blocked(self.model) else "minute"
         return reply
 
     async def _post(
@@ -414,6 +501,7 @@ class GroqLLM:
             models = [self.fallback_model] if self.ledger.blocked(self.model) else [self.model, self.fallback_model]
         response: Optional[httpx.Response] = None
         model = models[0]
+        waited = False
         for model in models:
             body = self._body(messages, model)
             body["stream"] = False
@@ -430,14 +518,45 @@ class GroqLLM:
             except httpx.HTTPError as exc:
                 raise LLMError(f"Groq request failed: {type(exc).__name__}") from None
             self.budget.update(response.headers)
+            if response.status_code == 429:
+                try:
+                    detail = response.json()["error"]["message"]
+                except Exception:
+                    detail = response.text[:300]
+                wait_s = exact_wait_seconds(detail)
+                if not is_daily_limit(detail) and wait_s is not None and wait_s <= MAX_MINUTE_LIMIT_WAIT_S and not waited:
+                    # Per-minute limit and Groq says it clears in a moment: a short pause is
+                    # better for the caller than an apology. Once per request.
+                    waited = True
+                    self.minute_limit_waits += 1
+                    log.warning("per-minute token limit of %s reached; waiting %.1f s and trying again", model, wait_s)
+                    await asyncio.sleep(wait_s + 0.2)
+                    if usage is not None:
+                        usage.requests += 1
+                    try:
+                        response = await self._client.post(GROQ_CHAT_URL, json=body, headers={"Authorization": f"Bearer {self._api_key}"})
+                    except httpx.HTTPError as exc:
+                        raise LLMError(f"Groq request failed: {type(exc).__name__}") from None
+                    self.budget.update(response.headers)
+                    if response.status_code != 429:
+                        break
             if response.status_code == 429 and model == self.model and self.fallback_model:
                 try:
                     detail = response.json()["error"]["message"]
                 except Exception:
                     detail = response.text[:300]
+                if not is_daily_limit(detail) and not self.ledger.blocked(self.fallback_model):
+                    # Still over the per-minute limit: the other model has its own.
+                    log.warning("per-minute token limit of %s reached; using %s for this request", model, self.fallback_model)
+                    continue
                 if is_daily_limit(detail):
                     wait_s = retry_after_seconds(detail)
                     self.ledger.block(self.model, wait_s)
+                    used = tokens_used(detail)
+                    if used is not None:
+                        added = self.ledger.correct(self.model, used)
+                        if added:
+                            log.warning("token count of %s raised by %d to match Groq's own figure (%d used today)", self.model, added, used)
                     self.model_fallbacks += 1
                     log.warning(
                         "daily token limit of %s reached; using %s for the next %.0f min", self.model, self.fallback_model, wait_s / 60.0

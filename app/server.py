@@ -353,7 +353,7 @@ class CallSession:
         self._record({"type": "call_start", "uuid": str(call_uuid), "mode": services.mode, "profile": profile})
         # Old debug recordings are removed whether or not recording is on right now.
         cleanup_old_recordings(s.recordings_dir)
-        if s.debug_record_audio:
+        if s.records_audio(services.profile.name if services.profile else None):
             self._audio_recorder = InboundRecorder(s.recordings_dir, str(call_uuid))
             log.warning("[%s] DEBUG_RECORD_AUDIO is on: caller audio is being recorded (kept %d days)", self._tag, RETENTION_DAYS)
 
@@ -435,7 +435,7 @@ class CallSession:
             log.info(
                 "call ended uuid=%s duration=%.2fs turns=%d total_ms_avg=%s total_ms_max=%s barge_ins=%d "
                 "false_pauses=%d outcome=%s replans=%d llm_paths=%s llm_24h=%s stt_audio_s=%.2f llm_tokens=%d llm_cached=%d eager_skipped=%d tts_chars=%d errors=%d "
-                "frames_in=%d frames_out=%d reason=%s",
+                "frames_in=%d frames_out=%d reason=%s%s",
                 s.call_uuid or "unknown",
                 s.duration_s(),
                 a["turns"],
@@ -456,6 +456,8 @@ class CallSession:
                 s.frames_in,
                 s.frames_out,
                 reason,
+(" phone=NO VALID PHONE" if a.get("valid_phone") is False and a["outcome"] not in (None, "not_fit") else "")
+                + (" phone_correction=UNCONFIRMED (old number kept)" if a.get("unconfirmed_corrections") else ""),
             )
         else:
             t = self._tracker
@@ -659,8 +661,9 @@ async def serve(lines: "Services | list[Services]") -> None:
     rtp_stats.cleanup_stale(settings.rtp_stats_dir)
     if settings.debug_record_audio:
         log.warning(
-            "DEBUG_RECORD_AUDIO is ON: caller audio of every call is saved to %s and deleted after %d days. "
+            "DEBUG_RECORD_AUDIO is ON: caller audio of every call%s is saved to %s and deleted after %d days. "
             "Use for test calls only.",
+            f" on the line(s) {', '.join(settings.debug_record_profiles)}" if settings.debug_record_profiles else "",
             settings.recordings_dir,
             RETENTION_DAYS,
         )

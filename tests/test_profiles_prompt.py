@@ -292,8 +292,8 @@ def test_prompt_stays_short() -> None:
     # The whole prompt is resent with every reply and counts against the per-minute token limit.
     for name in SHIPPED:
         text = build_system_prompt(load_profile(name, PROFILES_DIR))
-        assert len(text) < 3600, (name, len(text))
-        assert len(text.split()) < 620, (name, len(text.split()))
+        assert len(text) < 3700, (name, len(text))  # 3600 until the clinics got a "what to bring" line
+        assert len(text.split()) < 640, (name, len(text.split()))
 
 
 # ------------------------------------------------------------------ sentence splitting

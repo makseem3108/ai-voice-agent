@@ -85,7 +85,17 @@ def parse_rtp_stats(text: str) -> dict[str, Any]:
             continue
         if value != value or value in (float("inf"), float("-inf")):
             continue
-        stats[name] = int(value) if factor is None else round(value * factor, 1)
+        if factor is None:
+            count = int(value)
+            if name.endswith("_lost"):
+                # RTCP's "cumulative lost" is a signed 24-bit number: duplicates make it
+                # slightly negative, which Asterisk prints as 16777215. Negative = none lost.
+                if count >= 2**23:
+                    count -= 2**24
+                count = max(count, 0)
+            stats[name] = count
+        else:
+            stats[name] = round(value * factor, 1)
     for direction in ("rx", "tx"):
         packets, lost = stats.get(f"{direction}_packets"), stats.get(f"{direction}_lost")
         if isinstance(packets, int) and isinstance(lost, int) and packets + lost > 0 and lost >= 0:

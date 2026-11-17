@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .phones import digit_groups
+
 
 @dataclass(frozen=True)
 class LanguagePack:
@@ -29,10 +31,26 @@ class LanguagePack:
     neutral_closing: str
     #: Said when the call reaches the profile's hard time limit.
     time_limit: str
+    #: Said when speech recognition returned nothing usable in this language.
+    didnt_catch: str
+    #: Closing when we gave up on an answer that decides the outcome: a person will call back.
+    callback_closing: str
     #: How the model should speak in this language (part of the system prompt). Empty for English.
     speaking_rule: str
     #: Any wording of "is there anything else?" - only the server may ask that.
     anything_else_pattern: str
+    #: The words for 0-9, for reading a phone number back digit by digit.
+    digits: tuple[str, ...]
+    #: A complete phone number is read back for the caller to confirm, worded by the
+    #: program (``{digits}`` is filled in).
+    phone_confirm: str
+    #: An incomplete number is not read back: one short fixed request to say it again
+    #: (pre-generated, so it starts at once and is over before the caller answers).
+    phone_incomplete: str
+
+    def read_digits(self, number: str) -> str:
+        """Digit words in the groups people use (050, 123, 4567): a short pause between groups only."""
+        return ", ".join(" ".join(self.digits[int(ch)] for ch in group) for group in digit_groups(number))
 
     def asks_anything_else(self, text: str) -> bool:
         return bool(re.search(self.anything_else_pattern, text, re.IGNORECASE))
@@ -46,8 +64,13 @@ ENGLISH = LanguagePack(
     anything_else="Is there anything else I can help you with?",
     neutral_closing="Thank you for calling {business}. Goodbye!",
     time_limit="I'm sorry, but we've reached the time limit for this call. Thank you for calling {business}. Goodbye!",
+    didnt_catch="Sorry, I didn't catch that. Could you say it again?",
+    callback_closing="I'm sorry, I'm having trouble understanding. Someone from {business} will call you back. Goodbye!",
     speaking_rule="",
     anything_else_pattern=r"\b(anything|something) (else|more)\b|\bany(thing)? other (question|thing)s?\b|\bother questions\b|\bany more questions\b",
+    digits=("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"),
+    phone_confirm="I heard {digits}. Is that right?",
+    phone_incomplete="I didn't catch the whole number. Could you say it again, slowly?",
 )
 
 HEBREW = LanguagePack(
@@ -58,6 +81,8 @@ HEBREW = LanguagePack(
     anything_else="אפשר לעזור בעוד משהו?",
     neutral_closing="תודה שהתקשרתם ל{business}. להתראות!",
     time_limit="מצטערת, הגענו למגבלת הזמן של השיחה. תודה שהתקשרתם ל{business}. להתראות!",
+    didnt_catch="סליחה, לא שמעתי טוב. אפשר לחזור על זה?",
+    callback_closing="מצטערת, הקו לא כל כך ברור. מישהו מ{business} יחזור אליכם בטלפון. להתראות!",
     speaking_rule=(
         "Use everyday spoken Israeli Hebrew, in Hebrew letters, without nikud. "
         "The voice is a woman's: speak about yourself in the feminine. "
@@ -65,6 +90,9 @@ HEBREW = LanguagePack(
         "Write numbers, times and prices as Hebrew words, not digits."
     ),
     anything_else_pattern=r"עוד משהו|משהו נוסף|דבר נוסף|עוד שאלות|שאלות נוספות|משהו אחר",
+    digits=("אפס", "אחת", "שתיים", "שלוש", "ארבע", "חמש", "שש", "שבע", "שמונה", "תשע"),
+    phone_confirm="שמעתי {digits}. נכון?",
+    phone_incomplete="לא שמעתי את כל המספר. אפשר לומר אותו שוב, לאט?",
 )
 
 ARABIC = LanguagePack(
@@ -75,6 +103,8 @@ ARABIC = LanguagePack(
     anything_else="في إشي تاني ممكن أساعدك فيه؟",
     neutral_closing="شكراً لاتصالك ب{business}. مع السلامة!",
     time_limit="آسفة، لازم ننهي المكالمة هلأ. شكراً لاتصالك ب{business}. مع السلامة!",
+    didnt_catch="آسفة، ما سمعت منيح. ممكن تعيد لو سمحت؟",
+    callback_closing="آسفة، الصوت مش واضح عندي. رح نتصل فيك من {business}. مع السلامة!",
     speaking_rule=(
         "Use spoken Levantine Arabic as people talk on the phone in Jordan and Palestine "
         "(شو، بدي، هلأ، منيح، كتير، إشي), in Arabic letters, without tashkeel. "
@@ -83,6 +113,9 @@ ARABIC = LanguagePack(
         "Write numbers, times and prices as Arabic words, not digits."
     ),
     anything_else_pattern=r"(شي|إشي|اشي|شيء|حاجة|سؤال)\s+(تاني|ثاني|تانية|ثانية|آخر|اخر)|كمان (شي|إشي|اشي)|غير هيك",
+    digits=("صفر", "واحد", "اتنين", "تلاتة", "أربعة", "خمسة", "ستة", "سبعة", "تمانية", "تسعة"),
+    phone_confirm="سمعت {digits}. مزبوط؟",
+    phone_incomplete="ما سمعت النمرة كاملة. ممكن تعيدها كلها، شوي شوي؟",
 )
 
 PACKS: dict[str, LanguagePack] = {pack.code: pack for pack in (ENGLISH, HEBREW, ARABIC)}

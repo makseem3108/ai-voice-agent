@@ -42,31 +42,51 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
 from .audio_out import Pacer
-from .intent import DECLINE, GOODBYE, caller_reply_kind, interrupts_closing
+from .intent import (
+    DECLINE,
+    GOODBYE,
+    agrees,
+    mentions_digits,
+    same_words,
+    caller_reply_kind,
+    contains_words,
+    interrupts_closing,
+    is_question,
+    same_words,
+    skips_question,
+)
+from .phones import spoken_digits
 from .llm_groq import PATH_FUNCTION, PATH_JSON, PATH_TEXT, LLMError, LLMUsage
 from .profiles import Profile
-from .lang import ENGLISH, pack
-from .prompt_builder import ANYTHING_ELSE_QUESTION, build_directive, incomplete_closing
+from .lang import ENGLISH, base_language, pack
+from .prompt_builder import ANYTHING_ELSE_QUESTION, asks_for_update, build_directive, incomplete_closing, plain_reply, without_marker
 from .slots import (
     ANNOUNCE,
     ANSWER,
     COLLECT,
+    CONFIRM,
     FINAL,
     OUTCOME_INCOMPLETE,
     OUTCOME_NOT_FIT,
     OUTCOME_QUALIFIED,
     Plan,
+    OUTCOME_CALLBACK,
+    UNCLEAR,
+    SlotDef,
     SlotValue,
     affects_outcome,
     compute_outcome,
+    disqualifier,
     empty_slots,
     make_plan,
     merge_slots,
     plans_consistent,
+    render_template,
     reply_schema,
 )
 from .speech import (
@@ -90,6 +110,12 @@ log = logging.getLogger("voice_agent.agent")
 APOLOGY_TEXT = ENGLISH.apology
 #: Said (from the phrase cache) when the text-to-speech service asks us to slow down.
 ONE_MOMENT_TEXT = ENGLISH.one_moment
+#: After a pause that speech-to-text did not confirm, sound alone cannot pause the bot
+#: again for this long (speech-to-text can still interrupt it at any time).
+DETECTOR_REST_S = 1.0
+#: A complete number is read back and must be confirmed. After this many read-backs
+#: without a "yes" the number is left open and the business is told there is none.
+MAX_PHONE_READBACKS = 3
 #: Longest we keep the caller waiting before the one retry after a rate limit.
 MAX_RATE_LIMIT_WAIT_S = 4.0
 MAX_HISTORY_MESSAGES = 24
@@ -106,7 +132,13 @@ def hangup_reason(outcome: str) -> str:
         return "not-a-fit"
     if outcome == OUTCOME_INCOMPLETE:
         return "caller-goodbye"
+    if outcome == OUTCOME_CALLBACK:
+        return "needs-callback"
     return "goal-complete"  # qualified, or a profile-defined variant of it
+#: Alphabets by language, for telling "this cannot be the caller's language" (see _is_unintelligible).
+_SCRIPTS: dict[str, Optional[str]] = {"he": "HEBREW", "ar": "ARABIC"}
+
+
 def asks_anything_else(text: str, language: str = "en") -> bool:
     """Any wording of "is there anything else?" - only the server may ask that."""
     return pack(language).asks_anything_else(text)
@@ -131,6 +163,8 @@ def closing_text(profile: Profile, outcome: str) -> str:
     for variant in profile.outcomes:
         if variant.name == outcome:
             return variant.closing
+    if outcome == OUTCOME_CALLBACK:
+        return pack(profile.language).callback_closing.format(business=profile.business_name)
     return incomplete_closing(profile)
 
 
@@ -141,12 +175,31 @@ def fixed_phrases(profile: Profile) -> list[str]:
         pack(profile.language).apology,
         pack(profile.language).one_moment,
         pack(profile.language).anything_else,
+        *([pack(profile.language).phone_incomplete] if any(slot.type == "phone" for slot in profile.slots) else []),
         profile.closing_qualified,
         profile.closing_not_fit,
         *(variant.closing for variant in profile.outcomes),
         incomplete_closing(profile),
         goodbye_text(profile),
+        pack(profile.language).didnt_catch,
+        pack(profile.language).callback_closing.format(business=profile.business_name),
     ]
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    """Do two slot values say the same thing (a reworded text is not a change)?"""
+    if isinstance(a, dict) and isinstance(b, dict):
+        for key in ("number", "amount"):
+            if key in a or key in b:
+                return a.get(key) == b.get(key)
+        a, b = a.get("text"), b.get("text")
+    if isinstance(a, str) and isinstance(b, str):
+        return same_words(a, b)
+    return a == b
+
+
+def _changed_slots(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    return [name for name, value in after.items() if not _same_value(before.get(name), value)]
 
 
 class LLM(Protocol):
@@ -158,6 +211,8 @@ class LLM(Protocol):
         *,
         text_fallback: bool = True,
     ) -> dict[str, Any]: ...
+
+    async def reply_text(self, messages: list[dict[str, str]], usage: Optional[LLMUsage] = None) -> dict[str, Any]: ...
 
 
 class TTS(Protocol):
@@ -213,7 +268,7 @@ class _Job:
     committed: bool  # False = speculative head start; audio is held back
     metrics: Optional[TurnMetrics] = None
     task: Optional["asyncio.Task[None]"] = None
-    held: list[bytes] = field(default_factory=list)
+    held: list[tuple[bytes, bool]] = field(default_factory=list)
     sentences: list[str] = field(default_factory=list)
     raw: list[dict[str, Any]] = field(default_factory=list)  # every structured reply, as received
     cancelled: bool = False
@@ -227,6 +282,29 @@ class _Job:
     rejected: list[str] = field(default_factory=list)
     replanned: bool = False
     dropped_sentences: int = 0
+    #: Guard action taken this turn: "rephrase" (asked again in other words), "reworded" (the
+    #: model's own second wording was kept), "skip", "declined" (the caller would rather not
+    #: say), "redirect" (said what this business is), "callback" or "off_topic" (call closed).
+    guard: Optional[str] = None
+    close_outcome: Optional[str] = None  # the outcome a guard closes the call with
+    phone_invalid: Optional[str] = None  # digits heard a second time that are still not a phone number
+    gave_up: Optional[str] = None  # the slot the guard stopped asking for
+    #: After the outcome: the model flagged a correction on a plain turn, so the turn was redone as JSON.
+    marker: bool = False
+    #: After the outcome: the slots the caller changed (they are confirmed again).
+    corrected: list[str] = field(default_factory=list)
+    phone_reask: Optional[str] = None  # the phone slot being read back
+    phone_rejected: Optional[str] = None  # the caller said "no" to the number read back
+    phone_gave_up: Optional[str] = None  # one more number after too many read-backs: not read back, not kept
+    phone_pending: Optional[dict[str, Any]] = None  # ... and the number that was heard
+    #: A corrected number (after the outcome) that was read back; the old one stays until the caller says yes.
+    phone_fix: Optional[dict[str, Any]] = None
+    #: What became of the corrected number read back last turn: "confirmed" / "unconfirmed".
+    fix_result: Optional[str] = None
+    confirm_slot: Optional[str] = None  # the unasked disqualifying slot being checked with the caller
+    progress: bool = False  # the caller's turn changed at least one slot
+    asked_before: Optional[str] = None  # the slot that was being asked for when this turn began
+    templated: bool = False  # the announcement is the profile's fixed confirmation sentence
     #: How each reply of this job was obtained (json / function_call / text_fallback).
     paths: list[str] = field(default_factory=list)
 
@@ -267,6 +345,7 @@ class Agent:
         eager: bool = True,
         eager_allowed: Callable[[], bool] = lambda: True,
         merge_turns: bool = False,
+        loop_guard: bool = True,
         detector: Optional[VoiceDetector] = None,
         barge_confirm_s: float = 2.5,
         end_silence_s: float = 1.5,
@@ -309,6 +388,8 @@ class Agent:
         self.slots: dict[str, Optional[SlotValue]] = empty_slots(self._defs)
         #: The outcome the caller has been told about (and asked "anything else?" after).
         self.announced: Optional[str] = None
+        #: The slots as they were when the outcome was announced: what the caller was told we noted.
+        self._announced_slots: Optional[dict[str, Optional[SlotValue]]] = None
         #: Set when the closing line is spoken; cleared if the caller cancels the hang-up.
         self.outcome: Optional[str] = None
 
@@ -328,6 +409,23 @@ class Agent:
         #: Set after a plain-text fallback turn that was asking for a slot which
         #: decides the outcome: that slot is settled first on the next turn.
         self._recheck: Optional[str] = None
+        #: Loop guard: how often each slot has been asked without getting an answer.
+        self._loop_guard = loop_guard
+        self._asked: dict[str, int] = {}
+        #: Phone slots whose incomplete number was already read back once.
+        self._phone_reasked: set[str] = set()  # slots whose one "say it again" for an incomplete number is used
+        self._phone_readbacks: dict[str, int] = {}  # complete numbers read back so far, per slot
+        #: The number read back for each phone slot, kept until the caller confirms or corrects it.
+        self._phone_pending: dict[str, dict[str, Any]] = {}
+        #: After the outcome: a corrected number we read back and are waiting for a "yes" on.
+        #: Until then the number we had stays the stored one. Valid for the next turn only.
+        self._phone_fix: dict[str, dict[str, Any]] = {}
+        #: Phone slots whose correction was never confirmed (the old number was kept).
+        self._unconfirmed: set[str] = set()
+        #: Unasked disqualifying slots whose "not for us" reading the caller was asked to confirm.
+        self._disq_confirmed: set[str] = set()
+        self._fallback_reasons: set[str] = set()
+        self.unintelligible = 0
         self.llm_usage = LLMUsage()
 
         self._job: Optional[_Job] = None
@@ -338,6 +436,7 @@ class Agent:
         # local barge-in pause
         self._paused_at: Optional[float] = None
         self._pause_timer: Optional[asyncio.TimerHandle] = None
+        self._detector_off_until = 0.0
         # cancellable ending
         self._end_task: Optional[asyncio.Task[None]] = None
         #: Identity of the pending hang-up. Cancelling replaces it, and the hang-up
@@ -396,7 +495,9 @@ class Agent:
             if self._end_task is not None and self._pacer.speaking:
                 detector.reset()  # the closing line is never paused on sound alone
             elif self._pacer.speaking and not self._pacer.paused:
-                if detector.feed(frame):
+                if self._now() < self._detector_off_until:
+                    detector.reset()  # just after a false pause: the same noise must not stop the bot again
+                elif detector.feed(frame):
                     self._local_pause(detector.last_rms)
                     detector.reset()
             elif self._end_task is not None and not self._pacer.speaking:
@@ -445,8 +546,10 @@ class Agent:
         paused_ms = (self._now() - self._paused_at) * 1000.0
         self._paused_at = None
         self.false_pauses += 1
-        self._pacer.resume()
-        self._record({"type": "barge_resume", "paused_ms": round(paused_ms)})
+        # Never carry on in the middle of a word: drop a short rest, or say the sentence again.
+        action = self._pacer.resume_cleanly()
+        self._detector_off_until = self._now() + DETECTOR_REST_S
+        self._record({"type": "barge_resume", "paused_ms": round(paused_ms), "action": action})
 
     def _clear_pause(self) -> Optional[float]:
         """Forget a pending local pause; returns how long the bot had been paused (ms)."""
@@ -561,6 +664,8 @@ class Agent:
             return None
         plan = self._plan()
         if plan.kind == ANSWER:
+            if self._phone_fix and kind == DECLINE:
+                return None  # "no" answers "is that number right?", not "anything else?"
             return plan.outcome
         if kind == GOODBYE:
             return _EXTRACT_FIRST
@@ -633,6 +738,13 @@ class Agent:
         if self._pacer.speaking:  # stale audio must never overlap a new reply
             self._pacer.clear()
         self._clear_pause()
+
+        if self._is_unintelligible(text):
+            if job is not None:
+                self._cancel_job(job, interrupted=False)
+                job = None
+            if self._didnt_catch(text, metrics):
+                return
 
         closing_outcome = self._ends_the_call(text)
         if closing_outcome is not None:
@@ -719,14 +831,21 @@ class Agent:
         self._close_call(self._outcome() or OUTCOME_INCOMPLETE, job.metrics, job)
 
     def _messages(
-        self, job: _Job, plan: Plan, slots: dict[str, Optional[SlotValue]], *, replanned: bool, recheck: bool = False
+        self,
+        job: _Job,
+        plan: Plan,
+        slots: dict[str, Optional[SlotValue]],
+        *,
+        replanned: bool,
+        recheck: bool = False,
+        plain: Optional[bool] = None,
     ) -> list[dict[str, str]]:
         # Static prompt first, conversation next, this turn's instruction last:
         # the prefix never changes, so it stays cacheable.
         return (
             [{"role": "system", "content": self._system_prompt}]
             + job.history
-            + [{"role": "system", "content": build_directive(plan, slots, replanned=replanned, recheck=recheck)}]
+            + [{"role": "system", "content": build_directive(plan, slots, replanned=replanned, recheck=recheck, plain=plain)}]
         )
 
     async def _run_job(self, job: _Job) -> None:
@@ -734,6 +853,7 @@ class Agent:
             # Snapshot: a speculative job must not see or change live state.
             slots_before = dict(self.slots)
             announced = self.announced
+            asked = dict(self._asked)
             plan = make_plan(self._defs, slots_before, announced, self._variants)
             # The last turn was answered without reading any slots, and it was asking
             # for a slot that decides the outcome: settle that slot before moving on.
@@ -741,15 +861,230 @@ class Agent:
             if recheck:
                 plan = replace(plan, next=None)  # any progress then needs a fresh reply
             started = self._now()
-            reply = await self._llm.reply_json(
-                self._messages(job, plan, slots_before, replanned=False, recheck=recheck), self._schema, self.llm_usage
-            )
+            announced_slots = self._announced_slots
+            # The outcome was announced: nothing is collected any more, so the model just
+            # answers in plain sentences (no JSON to be rejected, no slots). Unless the caller
+            # may be correcting a detail: a number in what they said (a new phone number, a
+            # new hour) always gets a normal JSON turn ...
+            fixes = dict(self._phone_fix)  # ... as does the answer to "is that number right?"
+            plain = plain_reply(plan) and not fixes and not mentions_digits(job.transcript, self._profile.language)
+            messages = self._messages(job, plan, slots_before, replanned=False, recheck=recheck, plain=plain)
+            if plain:
+                reply = await self._llm.reply_text(messages, self.llm_usage)
+                reply.pop("slots", None)
+                if asks_for_update(str(reply.get("say") or "")):
+                    # ... and for anything else the model says so with a marker instead of an
+                    # answer. That reply is dropped (never spoken) and the turn done again as JSON.
+                    job.marker = True
+                    job.raw.append(reply)
+                    job.paths.append(str(reply.get("path") or PATH_JSON))
+                    messages = self._messages(job, plan, slots_before, replanned=False, plain=False)
+                    reply = await self._llm.reply_json(messages, self._schema, self.llm_usage)
+            else:
+                reply = await self._llm.reply_json(messages, self._schema, self.llm_usage)
             job.raw.append(reply)
             job.paths.append(str(reply.get("path") or PATH_JSON))
             self._note_model(reply)
             merged, job.rejected = merge_slots(self._defs, slots_before, reply.get("slots"))
+
+            job.asked_before = plan.target.name if plan.kind == COLLECT and plan.target is not None else None
+
+            # It sounds like something we do not offer - but the slot that says so was never
+            # asked, it was inferred from one sentence, possibly a misheard one. Check first.
+            confirm: Optional[SlotDef] = None
+            ruled_out = disqualifier(self._defs, merged)
+            if (
+                ruled_out is not None
+                and ruled_out.question is None
+                and ruled_out.name not in self._disq_confirmed
+                and slots_before.get(ruled_out.name) not in ruled_out.disqualifying
+            ):
+                confirm = ruled_out
+                merged[ruled_out.name] = None
+                job.confirm_slot = ruled_out.name
+
+            language = self._profile.language
+            target = plan.target if plan.kind == COLLECT else None
+            #: The slot nobody asks about that says "this is not for us" (if the profile has one).
+            scope = next((s for s in self._defs if s.question is None and s.disqualifying), None)
+
+            # "Never mind, go on": stop asking for a detail the caller would rather not give.
+            if (
+                target is not None
+                and confirm is None
+                and merged.get(target.name) is None
+                and not affects_outcome(target, self._variants)
+                and skips_question(job.transcript, language)
+            ):
+                merged[target.name] = UNCLEAR
+                job.guard = "declined"
+                job.gave_up = target.name
+
+            # We said what this business is and asked if that is what they need; a plain "yes"
+            # answers that even if the model did not write it down.
+            if (
+                scope is not None
+                and confirm is None
+                and scope.name in self._disq_confirmed
+                and all(value is None for value in merged.values())
+                and agrees(job.transcript, language)
+            ):
+                merged[scope.name] = next((v for v in scope.allowed or () if v not in scope.disqualifying), None)
+
+            # Every complete number is read back and kept only after the caller's "yes":
+            # wrong digits can still look like a valid number. That holds after a re-ask
+            # and after a correction too. An incomplete number is asked for again, once;
+            # if it is still not a phone number the second time, it is not kept at all.
+            heard: Optional[tuple[SlotDef, str, bool]] = None
+            for slot in self._defs:
+                if slot.type != "phone" or confirm is not None:
+                    continue
+                value = merged.get(slot.name)
+                before = slots_before.get(slot.name)
+                fix = fixes.get(slot.name) if plan.kind == ANSWER else None
+                if fix is not None:
+                    # Last turn we read a corrected number back. It replaces the one we have
+                    # only on a yes; on anything else the old number stays.
+                    known = {fix.get("number"), before.get("number") if isinstance(before, dict) else None}
+                    another = isinstance(value, dict) and bool(value.get("number")) and value.get("number") not in known
+                    if not another:
+                        if not self._refuses(job.transcript) and not is_question(job.transcript, language):
+                            merged[slot.name] = fix
+                            job.corrected.append(slot.name)
+                            job.fix_result = "confirmed"
+                        else:
+                            merged[slot.name] = before
+                            job.fix_result = "unconfirmed"
+                        continue
+                    job.fix_result = "unconfirmed"  # a third number: read that one back instead
+                # After the outcome a number other than the one we have is a correction;
+                # it is read back like the first one was.
+                corrected = (
+                    plan.kind == ANSWER
+                    and isinstance(value, dict)
+                    and bool(value.get("number"))
+                    and (before == UNCLEAR or (isinstance(before, dict) and before.get("number") != value.get("number")))
+                )
+                pending = self._phone_pending.get(slot.name)
+                confirms = not self._refuses(job.transcript) and not is_question(job.transcript, language)
+                if isinstance(value, dict) and (before is None or corrected):
+                    number, valid = value.get("number"), bool(value.get("valid"))
+                    if valid and not corrected and pending is not None and pending.get("valid") and pending.get("number") == number:
+                        # The number we just read back, said again by the caller ("yes, 050...").
+                        if not confirms:
+                            merged[slot.name] = None
+                            job.phone_rejected = slot.name
+                        continue
+                    if valid and not corrected and self._phone_readbacks.get(slot.name, 0) >= MAX_PHONE_READBACKS:
+                        job.phone_gave_up = str(number)
+                        merged[slot.name] = UNCLEAR  # never confirmed: not kept
+                        continue
+                    if number and (valid or corrected or slot.name not in self._phone_reasked):
+                        heard = (slot, str(number), valid)
+                        job.phone_reask = slot.name
+                        if corrected and isinstance(before, dict):
+                            # We already have a number: it stays until the caller confirms the new one.
+                            merged[slot.name] = before
+                            job.phone_fix = value if value.get("valid") else None
+                        else:
+                            merged[slot.name] = None
+                            job.phone_pending = value
+                        break
+                    if not value.get("number"):
+                        merged[slot.name] = None  # words, no digits: not an answer
+                    elif not value.get("valid"):
+                        job.phone_invalid = str(value["number"])
+                        merged[slot.name] = UNCLEAR  # a fragment is never stored as the number
+                    continue
+                if value is None and before is None and pending is not None and pending.get("valid"):
+                    if confirms:
+                        merged[slot.name] = pending  # "yes, that's right": the number we read back stands
+                    elif self._refuses(job.transcript):
+                        job.phone_rejected = slot.name  # "no": that number is forgotten
+
+            job.progress = confirm is not None or heard is not None or any(merged.get(n) != slots_before.get(n) for n in merged)
+
+            # Loop guard. The slot we asked for is still empty although the caller answered
+            # (a caller who asks us something instead is not counted). Asked once: ask again
+            # differently, naming the possible answers. Asked twice: stop asking.
+            times_asked = asked.get(target.name, 0) if target is not None else 0
+            unanswered = (
+                self._loop_guard
+                and target is not None
+                and merged.get(target.name) is None
+                and not job.progress  # the caller told us something, even if not this
+                and not is_question(job.transcript, language)
+                and reply.get("path") != PATH_TEXT
+            )
+            # Nothing at all is known yet: we do not even know that the caller wants what this
+            # business does. Asking the next question would be absurd. Say once what we are and
+            # ask if that is what they need; if that does not help either, close politely.
+            off_track = unanswered and all(value is None for value in merged.values())
+            close_as: Optional[tuple[str, str]] = None  # (guard action, outcome)
+            if off_track and scope is not None and scope.name in self._disq_confirmed:
+                close_as = ("off_topic", OUTCOME_NOT_FIT)
+            elif off_track and scope is not None and times_asked >= 1:
+                confirm = scope
+                job.confirm_slot = scope.name
+                job.guard = "redirect"
+            elif unanswered and times_asked >= 2 and target is not None:
+                if off_track or affects_outcome(target, self._variants):
+                    # Nothing to go on, or this answer decides whether we can help:
+                    # a person has to call back.
+                    close_as = ("callback", OUTCOME_CALLBACK)
+                else:
+                    merged[target.name] = UNCLEAR  # go on without it
+                    job.guard = "skip"
+                    job.gave_up = target.name
+            if close_as is not None:
+                job.guard, job.close_outcome = close_as
+                job.plan = plan
+                job.slots_after = merged
+                job.llm_first_token_ms = (self._now() - started) * 1000.0
+                job.finished = True
+                if job.committed and not job.cancelled:
+                    self._give_up_and_close(job)
+                return
+            rephrase = unanswered and times_asked == 1 and confirm is None
+
             plan_after = make_plan(self._defs, merged, announced, self._variants)
-            if not plans_consistent(plan, plan_after):
+            if plan_after.kind == ANSWER and plan_after.outcome != OUTCOME_NOT_FIT and heard is None and announced_slots is not None:
+                changed = _changed_slots(announced_slots, merged)
+                if changed:
+                    # The caller changed a detail after we confirmed the request: confirm it
+                    # again, with the same fixed sentence, so they hear what is noted now.
+                    job.corrected = list(dict.fromkeys(job.corrected + changed))
+                    plan_after = make_plan(self._defs, merged, None, self._variants)
+                else:
+                    merged = {**merged, **{n: announced_slots.get(n) for n in merged}}  # same details, keep our wording
+            say: Optional[str] = None
+            if confirm is not None:
+                plan_after = Plan(CONFIRM, reason=confirm)
+            elif heard is not None:
+                # Worded by the program: the digits are exact and the grammar cannot go wrong.
+                plan_after = Plan(COLLECT, target=heard[0], heard=spoken_digits(heard[1]), heard_complete=heard[2])
+                # A complete number is read back in groups; an incomplete one is only asked for again.
+                say = self._lang.phone_confirm.format(digits=self._lang.read_digits(heard[1])) if heard[2] else self._lang.phone_incomplete
+            elif rephrase and plan_after.kind == COLLECT and plan_after.target is target:
+                if self._repeats(str(reply.get("say") or ""), job, target):
+                    plan_after = replace(plan_after, attempt=2, next=None)
+                    job.guard = "rephrase"
+                else:
+                    # The model already asked in other words: keep that, save a request.
+                    rephrase = False
+                    job.guard = "reworded"
+            else:
+                rephrase = False
+            template = self._confirmation(plan_after) if plan_after.kind == ANNOUNCE else None
+            if template:
+                # Everything is collected. What the caller hears now is a fixed sentence filled
+                # in from the slots - the model cannot promise a booking, a time or a price.
+                plan = plan_after
+                say = render_template(template, merged)
+                job.templated = True
+            elif heard is not None:
+                plan = plan_after
+            elif confirm is not None or rephrase or job.guard in ("skip", "declined") or not plans_consistent(plan, plan_after):
                 # What the caller said changed what this turn must do (outcome decided,
                 # or several things answered at once). The first reply was written
                 # under the old plan, so get one for the new plan. Once only.
@@ -760,13 +1095,18 @@ class Agent:
                 job.raw.append(reply)
                 job.paths.append(str(reply.get("path") or PATH_JSON))
                 self._note_model(reply)
-                merged, more = merge_slots(self._defs, merged, reply.get("slots"))
-                job.rejected += more
+                if confirm is None and not rephrase:
+                    merged, more = merge_slots(self._defs, merged, reply.get("slots"))
+                    job.rejected += more
+                if rephrase and self._repeats(str(reply.get("say") or ""), job, None):
+                    say = self._lang.didnt_catch  # never the very same sentence twice in a row
+            if say is None:
+                say = without_marker(str(reply.get("say") or ""))
             job.llm_first_token_ms = (self._now() - started) * 1000.0
             job.plan = plan
             job.slots_after = merged
 
-            sentences = [clean_for_speech(s) for s in split_sentences(str(reply.get("say") or ""))]
+            sentences = [clean_for_speech(s) for s in split_sentences(say)]
             sentences = [s for s in sentences if s and any(ch.isalnum() for ch in s)]
             # "Anything else?" belongs to the server. Drop it if the model says it anyway.
             kept = [s for s in sentences if not self._lang.asks_anything_else(s)]
@@ -796,12 +1136,83 @@ class Agent:
         if job.committed and not job.cancelled:
             self._finalize(job)
 
+    def _repeats(self, say: str, job: _Job, target: Optional[SlotDef]) -> bool:
+        """Is this reply just the question again - what we said last, or the slot's stock question?"""
+        if not say.strip():
+            return True
+        last = next((m["content"] for m in reversed(job.history) if m.get("role") == "assistant"), "")
+        if last and (same_words(say, last) or contains_words(say, last)):
+            return True
+        return bool(target is not None and target.question and contains_words(say, target.question))
+
+    def _refuses(self, text: str) -> bool:
+        """Did the caller say no (to "is that number right?")."""
+        return caller_reply_kind(text, self._profile.language) == DECLINE
+
+    def _confirmation(self, plan: Plan) -> str:
+        """The profile's fixed confirmation sentence for this outcome ("" = let the model word it)."""
+        if plan.outcome == OUTCOME_QUALIFIED:
+            return self._profile.confirmation
+        for variant in self._variants:
+            if variant.name == plan.outcome:
+                return variant.confirmation
+        return ""
+
+    def _give_up_and_close(self, job: _Job) -> None:
+        """A guard ends the call: a person calls back (the answer that decides the outcome never
+        came), or - after we said what this business is - the caller wants something else."""
+        if self._job is job:
+            self._job = None
+        self._record_raw(job, job.metrics.index if job.metrics else None, complete=True)
+        if job.slots_after is not None:
+            self.slots = job.slots_after
+        self._record({"type": "loop_guard", "turn": self._turn_index, "action": job.guard or "callback", "slot": job.plan.target.name if job.plan and job.plan.target else None})
+        self._close_call(job.close_outcome or OUTCOME_CALLBACK, job.metrics, job)
+
+    def _is_unintelligible(self, text: str) -> bool:
+        """Speech recognition returned text that cannot be this line's language (e.g. English
+        words on the Arabic line). Only checked for languages with their own alphabet."""
+        scripts = {_SCRIPTS.get(base_language(code)) for code in (self._profile.language, *self._profile.stt.language_hints)}
+        if None in scripts or not scripts:
+            return False  # a Latin-script language is involved: no way to tell
+        letters = [ch for ch in text if ch.isalpha()]
+        if not letters:
+            return False  # digits only, e.g. a phone number
+        return not any(unicodedata.name(ch, "").startswith(tuple(s for s in scripts if s)) for ch in letters)
+
+    def _didnt_catch(self, text: str, metrics: TurnMetrics) -> bool:
+        """Handle an unintelligible turn without the model. Returns False if the turn
+        should go to the model after all (the loop guard just skipped the slot)."""
+        self.unintelligible += 1
+        plan = self._plan()
+        target = plan.target if plan.kind == COLLECT else None
+        count = self._asked.get(target.name, 0) if target is not None else 0
+        self._record({"type": "unintelligible", "turn": metrics.index, "text": text, "slot": target.name if target else None})
+        if target is not None and count >= 2:
+            if affects_outcome(target, self._variants) or all(value is None for value in self.slots.values()):
+                self._record({"type": "loop_guard", "turn": metrics.index, "action": "callback", "slot": target.name})
+                self._close_call(OUTCOME_CALLBACK, metrics)
+                return True
+            self.slots[target.name] = UNCLEAR
+            self._asked.pop(target.name, None)
+            self._record({"type": "loop_guard", "turn": metrics.index, "action": "skip", "slot": target.name})
+            return False  # let the model ask the next question
+        if target is not None:
+            self._asked[target.name] = count + 1
+        audio = self._phrases.cached(self._lang.didnt_catch)
+        if audio:
+            self._awaiting_first_frame = (metrics, None)
+            self._say_fixed(self._lang.didnt_catch, audio, kind="didnt_catch")
+        return True
+
     def _note_model(self, reply: dict[str, Any]) -> None:
-        """Log, once per call, that replies are coming from the fallback model."""
+        """Log, once per call and per cause, that a reply came from the fallback model."""
         model = reply.get("model")
-        if model and self.llm_fallback_model is None:
+        reason = str(reply.get("model_reason") or "daily")
+        if model and reason not in self._fallback_reasons:
+            self._fallback_reasons.add(reason)
             self.llm_fallback_model = str(model)
-            self._record({"type": "llm_fallback_model", "turn": self._turn_index, "model": str(model)})
+            self._record({"type": "llm_fallback_model", "turn": self._turn_index, "model": str(model), "reason": reason})
 
     async def _speak(self, job: _Job, text: str, *, count_chars: bool = True) -> None:
         """Turn one sentence into audio (cached phrase or TTS) and route it."""
@@ -810,7 +1221,7 @@ class Agent:
         if cached is not None:
             if job.tts_first_audio_ms is None:
                 job.tts_first_audio_ms = 0.0
-            self._emit(job, cached)
+            self._emit(job, cached, first=True)
             return
         if count_chars:
             self.tts_chars += len(text)
@@ -825,35 +1236,37 @@ class Agent:
             self._record({"type": "tts_rate_limited", "retry_after_s": round(exc.retry_after_s, 1), "waiting_s": round(wait_s, 1)})
             moment = self._phrases.cached(self._lang.one_moment)
             if moment is not None:
-                self._emit(job, moment)
+                self._emit(job, moment, first=True)
             await asyncio.sleep(wait_s)
             if job.cancelled:
                 return
             await self._synthesize(job, text, started)
 
     async def _synthesize(self, job: _Job, text: str, started: float) -> None:
+        first = True  # one request = one "sentence" for the pacer (restarted whole after a false pause)
         async for chunk in self._tts.stream(text):
             if job.tts_first_audio_ms is None:
                 job.tts_first_audio_ms = (self._now() - started) * 1000.0
             if job.cancelled:
                 return
-            self._emit(job, chunk)
+            self._emit(job, chunk, first=first)
+            first = False
 
-    def _emit(self, job: _Job, audio: bytes) -> None:
+    def _emit(self, job: _Job, audio: bytes, *, first: bool = False) -> None:
         if job.cancelled:
             return
         if job.committed:
-            self._pacer.push(audio)
+            self._pacer.push(audio, new_sentence=first)
         else:
-            job.held.append(audio)
+            job.held.append((audio, first))
 
     def _commit(self, job: _Job, metrics: TurnMetrics) -> None:
         """The head start was right: release the speculative reply."""
         job.committed = True
         job.metrics = metrics
         self._awaiting_first_frame = (metrics, job)
-        for chunk in job.held:
-            self._pacer.push(chunk)
+        for chunk, first in job.held:
+            self._pacer.push(chunk, new_sentence=first)
         job.held.clear()
         if job.finished:
             self._finalize(job)
@@ -864,6 +1277,25 @@ class Agent:
             self.slots = job.slots_after
         if announced and job.plan is not None and job.plan.kind == ANNOUNCE:
             self.announced = job.plan.outcome
+            self._announced_slots = dict(self.slots)
+        if job.fix_result is not None or job.phone_fix is not None:
+            # The corrected number read back last turn is settled now, one way or the other.
+            for name in self._phone_fix:
+                (self._unconfirmed.discard if job.fix_result == "confirmed" else self._unconfirmed.add)(name)
+            self._phone_fix = {}
+        if announced and job.phone_fix is not None and job.phone_reask:
+            self._phone_fix = {job.phone_reask: job.phone_fix}
+        if job.marker or job.corrected or job.fix_result or job.phone_fix is not None:
+            self._record(
+                {
+                    "type": "correction",
+                    "turn": self._turn_index,
+                    "slots": list(job.corrected),
+                    "marker": job.marker,
+                    "pending": [job.phone_reask] if job.phone_fix is not None and job.phone_reask else [],
+                    "unconfirmed": sorted(self._unconfirmed) if job.fix_result == "unconfirmed" else [],
+                }
+            )
         plan = job.plan
         if (
             job.spoke_plain_text
@@ -875,6 +1307,39 @@ class Agent:
             self._recheck = plan.target.name  # see _run_job
         elif job.paths:
             self._recheck = None
+        # A slot that now has a value (answered, or given up on) stops being counted.
+        for name in [n for n in self._asked if self.slots.get(n) is not None]:
+            del self._asked[name]
+        if job.phone_invalid is not None:
+            self._record({"type": "phone_invalid", "turn": self._turn_index, "heard": spoken_digits(job.phone_invalid)})
+        if job.phone_rejected is not None:
+            self._phone_pending.pop(job.phone_rejected, None)
+            self._record({"type": "phone_rejected", "turn": self._turn_index, "slot": job.phone_rejected})
+        if job.phone_gave_up is not None:
+            self._record({"type": "phone_gave_up", "turn": self._turn_index, "heard": spoken_digits(job.phone_gave_up), "readbacks": MAX_PHONE_READBACKS})
+        if job.guard:
+            self._record({"type": "loop_guard", "turn": self._turn_index, "action": job.guard, "slot": job.gave_up or (plan.target.name if plan and plan.target else job.asked_before)})
+        if announced:  # the reply was said to the end
+            if job.confirm_slot:
+                self._disq_confirmed.add(job.confirm_slot)
+                self._record({"type": "scope_check", "turn": self._turn_index, "slot": job.confirm_slot})
+            if job.phone_reask:
+                if plan is not None and plan.heard_complete:
+                    self._phone_readbacks[job.phone_reask] = self._phone_readbacks.get(job.phone_reask, 0) + 1
+                else:
+                    self._phone_reasked.add(job.phone_reask)  # only an incomplete number uses up the re-ask
+                if job.phone_pending is not None:
+                    self._phone_pending[job.phone_reask] = job.phone_pending
+                self._record({"type": "phone_readback", "turn": self._turn_index, "slot": job.phone_reask, "heard": plan.heard if plan else None, "complete": bool(plan.heard_complete) if plan else None})
+            now = self._plan()
+            if now.kind == COLLECT and now.target is not None and not job.spoke_plain_text:
+                name = now.target.name
+                if name != job.asked_before or name not in self._asked:
+                    self._asked.setdefault(name, 1)  # a new question: its first ask
+                elif not job.progress and not is_question(job.transcript, self._profile.language):
+                    # The same question again, and the caller's turn gave us nothing at all
+                    # (a caller who asks something, or answers a different question, is not counted).
+                    self._asked[name] = self._asked.get(name, 0) + 1
         self._record_state(job)
 
     def _record_state(self, job: Optional[_Job] = None) -> None:
@@ -892,6 +1357,9 @@ class Agent:
                 "replanned": bool(job and job.replanned),
                 "llm_path": job.llm_path if job else None,
                 "recheck": self._recheck,
+                "asked": dict(self._asked),
+                "unclear": [name for name, value in self.slots.items() if value == UNCLEAR],
+                "templated": bool(job and job.templated),
                 "rejected": list(job.rejected) if job else [],
             }
         )
@@ -966,7 +1434,7 @@ class Agent:
 
     # ------------------------------------------------------------------ fixed phrases / endings
     def _say_fixed(self, text: str, audio: bytes, *, kind: str) -> None:
-        self._pacer.push(audio)
+        self._pacer.push(audio, new_sentence=True)
         self._pacer.flush()
         self.history.append({"role": "assistant", "content": text})
         self._record({"type": "bot", "turn": None, "text": text, "kind": kind})
@@ -1131,4 +1599,16 @@ class Agent:
             "llm_cached_tokens": self.llm_usage.cached_tokens,
             "tts_chars": self.tts_chars,
             "tts_rate_limited": self.tts_rate_limited,
+            "unintelligible": self.unintelligible,
+            "unclear_slots": [name for name, value in self.slots.items() if value == UNCLEAR],
+            "valid_phone": self._valid_phone(),
+            # A new number was read back but never confirmed (e.g. the caller hung up): the old one was kept.
+            "unconfirmed_corrections": sorted(self._unconfirmed | set(self._phone_fix)),
         }
+
+    def _valid_phone(self) -> Optional[bool]:
+        """Do we have a usable phone number? None if this profile does not ask for one."""
+        names = [slot.name for slot in self._defs if slot.type == "phone"]
+        if not names:
+            return None
+        return all(isinstance(self.slots.get(n), dict) and bool(self.slots[n].get("valid")) for n in names)

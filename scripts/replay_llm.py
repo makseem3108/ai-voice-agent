@@ -46,8 +46,10 @@ import httpx  # noqa: E402
 from app.config import load_settings  # noqa: E402
 from app.llm_groq import GroqLLM, LLMError, LLMUsage, TokenLedger  # noqa: E402
 from app.profiles import Profile, load_profile  # noqa: E402
-from app.prompt_builder import ANYTHING_ELSE_QUESTION, build_directive, build_system_prompt  # noqa: E402
-from app.slots import FINAL, Plan, empty_slots, make_plan, merge_slots, reply_schema  # noqa: E402
+from app.intent import mentions_digits  # noqa: E402
+from app.prompt_builder import ANYTHING_ELSE_QUESTION, asks_for_update, build_directive, build_system_prompt, plain_reply  # noqa: E402
+from app.lang import pack  # noqa: E402
+from app.slots import CONFIRM, FINAL, Plan, empty_slots, make_plan, merge_slots, render_template, reply_schema  # noqa: E402
 from app.text_utils import clean_fallback_text  # noqa: E402
 
 TOKENS_PER_MINUTE = 6000  # stay below Groq's 8,000 free-tier limit
@@ -67,6 +69,8 @@ class Scenario:
     #: Slot values the reply must contain after merging (money slots: the amount).
     expect: dict[str, Any] = field(default_factory=dict)
     final: bool = False  # the goodbye extraction request
+    #: Name of the unasked scope slot: send the "say what this business is" instruction for it.
+    redirect: Optional[str] = None
 
 
 def english_scenarios() -> list[Scenario]:
@@ -141,6 +145,14 @@ CLINIC_LINES = {
         "two": "It's my first visit, and I'd like Tuesday morning.",
         "braces": "I need braces for my son.",
         "bye": "Zero five two, one two three, four five six seven. Thanks, goodbye.",
+        "family_doctor": "I'd like an appointment with a family doctor.",
+        "eye_exam": "I need an eye exam, I want to check my glasses.",
+        "confirmed": "So my appointment tomorrow at four is confirmed, right?",
+        "price": "How much does a check-up cost, and what should I bring?",
+        "off_topic": "I want four kilos of tomatoes.",
+        "never_mind": "Never mind the number, just go on.",
+        "new_phone": "Wait, the number is wrong. It's 052 987 6543.",
+        "new_time": "Actually, Wednesday morning would be better for me.",
     },
     "he": {
         "hours": "מה שעות הפתיחה שלכם?",
@@ -149,6 +161,14 @@ CLINIC_LINES = {
         "two": "זה ביקור ראשון, ואני רוצה ביום שלישי בבוקר.",
         "braces": "אני צריך יישור שיניים לבן שלי, גשר.",
         "bye": "אפס חמש שתיים, אחת שתיים שלוש, ארבע חמש שש שבע. תודה, להתראות.",
+        "family_doctor": "אני רוצה לקבוע תור לרופא משפחה.",
+        "eye_exam": "אני צריך בדיקת עיניים, לבדוק את המשקפיים.",
+        "confirmed": "אז התור שלי מחר בארבע מאושר, נכון?",
+        "price": "כמה עולה בדיקה, ומה צריך להביא?",
+        "off_topic": "אני רוצה ארבעה קילו עגבניות.",
+        "never_mind": "לא חשוב המספר, תמשיך הלאה.",
+        "new_phone": "רגע, המספר לא נכון. זה 052 987 6543.",
+        "new_time": "בעצם, עדיף לי ביום רביעי בבוקר.",
     },
     "ar": {
         "hours": "شو ساعات الدوام عندكم؟",
@@ -157,8 +177,36 @@ CLINIC_LINES = {
         "two": "هاي أول زيارة، وبدي يوم الثلاثا الصبح.",
         "braces": "بدي تقويم أسنان لابني.",
         "bye": "صفر خمسة اثنين، واحد اثنين ثلاثة، أربعة خمسة ستة سبعة. شكراً، مع السلامة.",
+        "family_doctor": "بدي أحجز موعد عند دكتور عيلة.",
+        "eye_exam": "بدي فحص نظر، بدي أفحص النظارات.",
+        "confirmed": "يعني موعدي بكرا الساعة أربعة مأكد، صح؟",
+        "price": "كم بكلف الفحص، وشو لازم أجيب معي؟",
+        "off_topic": "بدي أربعة كيلو بندورة.",
+        "never_mind": "مش مهم الرقم، كمّل.",
+        "new_phone": "لحظة، النمرة غلط. النمرة 052 987 6543.",
+        "new_time": "لحظة، الأحسن إلي يوم الأربعا الصبح.",
     },
 }
+
+
+#: Every clinic slot filled: the request is complete and has been confirmed to the caller.
+DONE = {"service_offered": "yes", "reason": "check-up", "patient_status": "new", "preferred_time": "tomorrow at four", "name": "Dana", "phone": "0521234567"}
+
+
+#: The same, in the caller's words for the other languages.
+DONE_LOCAL = {
+    "he": {"reason": "בדיקה", "preferred_time": "מחר בארבע", "name": "דנה"},
+    "ar": {"reason": "فحص", "preferred_time": "بكرا الساعة أربعة", "name": "دانا"},
+}
+
+
+def done_slots(profile: Profile) -> dict[str, Any]:
+    return {**DONE, **DONE_LOCAL.get(profile.language.split("-")[0], {})}
+
+
+def render_confirmation(profile: Profile) -> str:
+    slots, _ = merge_slots(profile.slots, empty_slots(profile.slots), done_slots(profile))
+    return f"{render_template(profile.confirmation, slots)} {pack(profile.language).anything_else}".strip()
 
 
 def clinic_scenarios(profile: Profile) -> list[Scenario]:
@@ -176,6 +224,53 @@ def clinic_scenarios(profile: Profile) -> list[Scenario]:
             expect={"patient_status": "new", "preferred_time": "*"},
         ),
         Scenario("not a fit (braces)", [say["braces"]], expect={"service_offered": "no"}),
+        # A dental clinic: anything that is not dentistry must be recognised as out of scope ...
+        Scenario("out of scope: family doctor", [say["family_doctor"]], expect={"service_offered": "no"}),
+        Scenario("out of scope: eye exam", [say["eye_exam"]], expect={"service_offered": "no"}),
+        # Nothing to do with a clinic at all (real call 2026-11-12: a caller asked for tomatoes).
+        Scenario("off-topic: tomatoes", [say["off_topic"]], expect={"service_offered": "no"}),
+        # What the caller hears next: who we are, and is that what you need? (read with --show)
+        Scenario("off-topic: the redirect", [say["off_topic"]], redirect="service_offered", expect={"service_offered": None}),
+        # "Never mind the number": the model must not invent one (the code then stops asking).
+        Scenario(
+            "phone refusal",
+            [say["reason"], ask["phone"], say["never_mind"]],
+            known={"service_offered": "yes", "reason": say["reason"], "patient_status": "new", "preferred_time": "Tuesday", "name": "Dana"},
+            expect={"phone": None},
+        ),
+        # ... and then told so politely (this is the reply after the code has decided "not a fit").
+        Scenario("out of scope: what the caller is told", [say["eye_exam"]], known={"service_offered": "no"}),
+        # The bot only takes a request. Read these replies: it must not say the appointment is
+        # confirmed or booked, and must not invent a price or instructions (run with --show).
+        Scenario(
+            "no commitment: is my appointment confirmed?",
+            [say["bye"].split(".")[0] + ".", render_confirmation(profile), say["confirmed"]],
+            known=done_slots(profile),
+            announced="qualified",
+        ),
+        Scenario(
+            "no commitment: price and what to bring",
+            [say["bye"].split(".")[0] + ".", render_confirmation(profile), say["price"]],
+            known=done_slots(profile),
+            announced="qualified",
+        ),
+        # A detail changed after the request was confirmed. A number in the sentence gets a JSON
+        # turn at once; anything else must come back as the [UPDATE] marker and is then redone
+        # as JSON ("!" = the slot must hold a new value).
+        Scenario(
+            "correction after booking: phone",
+            [say["bye"].split(".")[0] + ".", render_confirmation(profile), say["new_phone"]],
+            known=done_slots(profile),
+            announced="qualified",
+            expect={"phone": "0529876543"},
+        ),
+        Scenario(
+            "correction after booking: time",
+            [say["bye"].split(".")[0] + ".", render_confirmation(profile), say["new_time"]],
+            known=done_slots(profile),
+            announced="qualified",
+            expect={"preferred_time": "!"},
+        ),
         Scenario(
             "goodbye that carries an answer",
             [say["reason"], ask["phone"], say["bye"]],
@@ -190,18 +285,22 @@ def scenarios_for(profile: Profile) -> list[Scenario]:
     return clinic_scenarios(profile) if profile.name.startswith("clinic") else english_scenarios()
 
 
-def build_messages(profile: Profile, scenario: Scenario) -> tuple[list[dict[str, str]], dict[str, Any]]:
+def build_messages(
+    profile: Profile, scenario: Scenario
+) -> tuple[list[dict[str, str]], dict[str, Any], bool, list[dict[str, str]]]:
     slots, _ = merge_slots(profile.slots, empty_slots(profile.slots), scenario.known)
     plan = Plan(FINAL) if scenario.final else make_plan(profile.slots, slots, scenario.announced, profile.outcomes)
+    if scenario.redirect:
+        plan = Plan(CONFIRM, reason=next(slot for slot in profile.slots if slot.name == scenario.redirect))
     history = [{"role": "assistant", "content": profile.greeting}]
     for index, line in enumerate(scenario.lines):
         history.append({"role": "user" if index % 2 == 0 else "assistant", "content": line})
-    messages = (
-        [{"role": "system", "content": build_system_prompt(profile)}]
-        + history
-        + [{"role": "system", "content": build_directive(plan, slots)}]
-    )
-    return messages, slots
+    # plain: a turn after the outcome, answered without JSON - unless a number was said (as on the phone line)
+    plain = plain_reply(plan) and not mentions_digits(scenario.lines[-1], profile.language)
+    base = [{"role": "system", "content": build_system_prompt(profile)}] + history
+    messages = base + [{"role": "system", "content": build_directive(plan, slots, plain=plain)}]
+    as_json = base + [{"role": "system", "content": build_directive(plan, slots, plain=False)}]
+    return messages, slots, plain, as_json
 
 
 def check(profile: Profile, scenario: Scenario, slots: dict[str, Any], reply: dict[str, Any]) -> Optional[str]:
@@ -212,8 +311,15 @@ def check(profile: Profile, scenario: Scenario, slots: dict[str, Any], reply: di
     for name, wanted in scenario.expect.items():
         got = merged.get(name)
         if isinstance(got, dict):
-            got = got.get("amount")
-        if wanted == "*":
+            got = got.get("number") if "number" in got else got.get("amount") if "amount" in got else got.get("text")
+        if wanted is None:
+            if got is not None:
+                return f"{name}={got!r}, expected it to stay empty"
+        elif wanted == "!":
+            before = slots.get(name)
+            if got in (None, "") or got == (before.get("text") if isinstance(before, dict) else before):
+                return f"{name}={got!r}, expected a new value"
+        elif wanted == "*":
             if got in (None, ""):
                 return f"{name} is empty, expected a value"
         elif str(got).lower() != str(wanted).lower():
@@ -225,9 +331,10 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--runs", type=int, default=3, help="how many times each scenario is sent (default 3)")
     parser.add_argument("--profile", default="lead_qualification")
-    parser.add_argument("--only", default="", help="run only scenarios whose name contains this text")
+    parser.add_argument("--only", default="", help="run only scenarios whose name contains this text (several: separate with commas)")
     parser.add_argument("--show", action="store_true", help="print what the model said in each run")
     parser.add_argument("--model", default="", help="send to this model instead of GROQ_MODEL (e.g. openai/gpt-oss-20b)")
+    parser.add_argument("--pace", type=float, default=0.0, help="wait at least this many seconds after every run (room for a retry inside the per-minute limit)")
     parser.add_argument("--allow-more", action="store_true", help=f"lift the limit of {MAX_REQUESTS} requests per run (uses up the daily token allowance)")
     args = parser.parse_args()
 
@@ -236,7 +343,8 @@ async def main() -> int:
         print("GROQ_API_KEY is not set in .env")
         return 2
     profile = load_profile(args.profile, ROOT / "profiles")
-    scenarios = [s for s in scenarios_for(profile) if args.only.lower() in s.name.lower()]
+    wanted = [part.strip().lower() for part in args.only.split(",") if part.strip()] or [""]
+    scenarios = [s for s in scenarios_for(profile) if any(part in s.name.lower() for part in wanted)]
     schema = reply_schema(profile.slots)
     model = args.model or settings.groq_model
     planned = len(scenarios) * args.runs
@@ -247,7 +355,9 @@ async def main() -> int:
     print(f"profile={profile.name} language={profile.language} model={model} runs per scenario={args.runs}\n")
     requests_sent = 0
 
-    totals = {"json": 0, "function_call": 0, "fallback": 0, "apology": 0}
+    totals = {"json": 0, "function_call": 0, "plain": 0, "fallback": 0, "apology": 0}
+    json_rejections = 0
+    resent = 0
     wrong = 0
     first_try_tokens: list[tuple[int, int]] = []  # (prompt, completion) of replies that needed one request
     wrong_language = 0
@@ -256,21 +366,38 @@ async def main() -> int:
         llm = GroqLLM(http, settings.groq_api_key, model, ledger=ledger)  # no fallback model: we test exactly this one
         llm.fallback_language = profile.language
         for scenario in scenarios:
-            messages, slots = build_messages(profile, scenario)
+            messages, slots, plain, as_json = build_messages(profile, scenario)
             results: list[str] = []
             notes: list[str] = []
             times: list[float] = []
-            for _ in range(args.runs):
+            runs_left = args.runs
+            resend = False
+            while runs_left > 0:
+                runs_left -= 1
                 if requests_sent >= MAX_REQUESTS and not args.allow_more:
                     notes.append(f"stopped: {MAX_REQUESTS} requests sent (retries count too)")
                     break
                 usage = LLMUsage()
                 started = time.monotonic()
                 try:
-                    reply = await llm.reply_json(messages, schema, usage, text_fallback=not scenario.final)
+                    marker = False
+                    if plain:
+                        reply = await llm.reply_text(messages, usage)
+                        if asks_for_update(str(reply.get("say") or "")):
+                            marker = True
+                            reply = await llm.reply_json(as_json, schema, usage)
+                    else:
+                        reply = await llm.reply_json(messages, schema, usage, text_fallback=not scenario.final)
                     outcome = {"text_fallback": "fallback"}.get(str(reply.get("path")), str(reply.get("path") or "json"))
-                    if outcome != "fallback":
-                        problem = check(profile, scenario, slots, reply)
+                    if outcome in ("function_call", "fallback"):
+                        json_rejections += 1
+                    if scenario.announced:
+                        notes.append("marker [UPDATE] fired, turn redone as JSON" if marker else "plain turn, no marker" if plain else "a number was said: JSON turn, no marker needed")
+                    if outcome not in ("fallback", "plain") or scenario.expect:
+                        problem = "the marker did not fire, nothing was recorded" if outcome == "plain" else check(profile, scenario, slots, reply)
+                        if not problem and scenario.announced and scenario.expect:
+                            new, _ = merge_slots(profile.slots, slots, reply.get("slots"))
+                            notes.append("slot updated: " + ", ".join(f"{n}={(new[n].get('number') or new[n].get('text')) if isinstance(new[n], dict) else new[n]!r}" for n in scenario.expect))
                         if problem:
                             wrong += 1
                             notes.append(f"wrong slots ({outcome}): {problem}")
@@ -278,21 +405,32 @@ async def main() -> int:
                         else:
                             outcome_ok = True
                     else:
-                        outcome_ok = False
+                        outcome_ok = outcome == "plain"
                     if usage.requests == 1:
                         first_try_tokens.append((usage.prompt_tokens, usage.completion_tokens))
                     if not scenario.final and clean_fallback_text(str(reply.get("say") or ""), profile.language) is None:
                         wrong_language += 1
                         notes.append(f"say is not clean {profile.language}: {str(reply.get('say'))[:80]!r}")
                     if args.show or outcome == "fallback":
-                        notes.append(f"{outcome} said: {str(reply.get('say'))[:100]!r}")
+                        notes.append(f"{outcome} said: {str(reply.get('say'))[:160]!r}")
+                    if args.show:
+                        notes.append(f"tokens: prompt={usage.prompt_tokens} cached={usage.cached_tokens} out={usage.completion_tokens} requests={usage.requests}{' (resent after a 429)' if resend else ''}")
+                    resend = False
                 except LLMError as exc:
                     outcome, outcome_ok = "apology", False
                     notes.append(str(exc)[:80])
                     if "429" in str(exc):
                         # Over the per-minute limit (something else is using the key too):
-                        # wait it out, or every following run fails the same way.
-                        await asyncio.sleep(30.0)
+                        # wait a full minute and send this run again, once.
+                        await asyncio.sleep(62.0)
+                        requests_sent += usage.requests
+                        if not resend:
+                            resend = True
+                            resent += 1
+                            runs_left += 1
+                            notes.append("429 (per-minute limit): waited 62 s and sent this run again")
+                            continue
+                        usage = LLMUsage()
                 requests_sent += usage.requests
                 elapsed = (time.monotonic() - started) * 1000.0
                 times.append(elapsed)
@@ -300,10 +438,10 @@ async def main() -> int:
                 results.append(outcome if outcome_ok or outcome in ("fallback", "apology") else "wrong")
                 totals[outcome] += 1
                 # pace: spread the tokens just used over the per-minute budget
-                await asyncio.sleep(min(40.0, max(2.0, usage.total_tokens / TOKENS_PER_MINUTE * 60.0)))
-            passed = sum(1 for r in results if r in ("json", "function_call"))
+                await asyncio.sleep(max(args.pace, min(40.0, max(2.0, usage.total_tokens / TOKENS_PER_MINUTE * 60.0))))
+            passed = sum(1 for r in results if r in ("json", "function_call", "plain"))
             avg = f"{sum(times) / len(times):4.0f} ms" if times else "   -   "
-            counts = " ".join(f"{k}={results.count(k)}" for k in ("json", "function_call", "fallback", "apology", "wrong") if results.count(k))
+            counts = " ".join(f"{k}={results.count(k)}" for k in ("json", "function_call", "plain", "fallback", "apology", "wrong") if results.count(k))
             print(f"  {'OK  ' if passed == len(results) else 'FAIL'} {passed}/{len(results)}  {avg}  {scenario.name}  [{counts}]", flush=True)
             for note in dict.fromkeys(notes):
                 print(f"            {note}")
@@ -313,10 +451,11 @@ async def main() -> int:
         return f"{sum(latency[key]) / len(latency[key]):.0f} ms" if latency[key] else "-"
 
     print(f"\n{runs} runs:")
-    for key, label in (("json", "JSON mode"), ("function_call", "function call (2 requests)"), ("fallback", "plain-text fallback"), ("apology", "apology")):
+    for key, label in (("json", "JSON mode"), ("function_call", "function call (2 requests)"), ("plain", "plain text (after the outcome)"), ("fallback", "plain-text fallback"), ("apology", "apology")):
         print(f"  {label:28} {totals[key]:3d}  ({100.0 * totals[key] / max(runs, 1):3.0f}%)  avg {avg_ms(key)}")
     everything = [t for values in latency.values() for t in values]
-    passed_total = totals["json"] + totals["function_call"] - wrong
+    passed_total = totals["json"] + totals["function_call"] + totals["plain"] - wrong
+    print(f"  JSON rejections (needed a second request): {json_rejections}   runs resent after a 429: {resent}")
     print(f"  wrong slot values: {wrong}   overall avg latency: {sum(everything) / max(len(everything), 1):.0f} ms")
     if first_try_tokens:
         prompt_avg = sum(p for p, _ in first_try_tokens) / len(first_try_tokens)

@@ -181,3 +181,91 @@ def interrupts_closing(text: str, language: str = "en") -> bool:
     if caller_reply_kind(text) is not None:
         return False  # "no thanks", "bye", "ok thank you"
     return "?" in (text or "") or bool(_QUESTION_WORDS.search(norm))
+
+
+def is_question(text: str, language: str = "en") -> bool:
+    """Did the caller ask something (rather than answer)? Used so that a caller who asks
+    questions is not treated as someone who failed to answer."""
+    if "?" in (text or "") or "؟" in (text or ""):
+        return True
+    words = _BY_LANGUAGE.get((language or "en").split("-")[0].lower())
+    if words is not None:
+        return bool(words.question.search(_normalise_any(text)))
+    return bool(_QUESTION_WORDS.search(_normalise(text or "")))
+
+
+# --------------------------------------------------------------------------- "never mind" / "yes"
+#: The caller does not want to answer the question that was asked ("never mind, go on").
+_SKIP_EN = re.compile(
+    r"\b(never ?mind|doesn'?t matter|does not matter|not important|skip (it|that|this)|move on|go on|"
+    r"let'?s continue|carry on|i'?d rather not|i would rather not|prefer not to|"
+    r"don'?t want to (give|say|share)|no number|without (a |the )?number|i don'?t have (one|a number))\b"
+)
+_SKIP = {
+    "he": _w("לא חשוב|לא משנה|תמשיך הלאה|תמשיכי הלאה|תמשיך|תמשיכי|נמשיך|הלאה|עזוב|עזבי|תדלג|תדלגי|"
+             "לא רוצה לתת|לא רוצה להגיד|לא רוצה למסור|בלי מספר|אין לי מספר|לא צריך מספר"),
+    "ar": _w("مش مهم|مو مهم|بلاش|كمل|كملي|خلينا نكمل|ما بدي اعطي|ما بدي احكي|بدون رقم|بدون نمره|"
+             "ما معي رقم|ما عندي رقم|ما معي نمره|مش ضروري"),
+}
+_AGREE_EN = re.compile(r"^(yes|yeah|yep|yup|sure|ok|okay|right|correct|exactly|please|of course)\b")
+_AGREE = {
+    "he": re.compile(r"^(כן|נכון|בטח|בוודאי|בסדר|אוקיי|אוקי|בדיוק|בבקשה)(?!\w)"),
+    "ar": re.compile(r"^(اه|ايوه|ايوا|نعم|اي|تمام|ماشي|اكيد|صح|مزبوط|مظبوط|طبعا|يا ريت)(?!\w)"),
+}
+
+
+def _base(language: str) -> str:
+    return (language or "en").split("-")[0].lower()
+
+
+def skips_question(text: str, language: str = "en") -> bool:
+    """Did the caller say they would rather not answer ("never mind the number, go on")?"""
+    pattern = _SKIP.get(_base(language))
+    if pattern is not None:
+        return bool(pattern.search(_normalise_any(text)))
+    return bool(_SKIP_EN.search(_normalise(text or "")))
+
+
+def agrees(text: str, language: str = "en") -> bool:
+    """Does the caller's reply start with a plain "yes"?"""
+    pattern = _AGREE.get(_base(language))
+    if pattern is not None:
+        return bool(pattern.match(_normalise_any(text)))
+    return bool(_AGREE_EN.match(_normalise(text or "")))
+
+
+def same_words(a: str, b: str) -> bool:
+    """Are two sentences the same once case, marks and punctuation are ignored?"""
+    return _normalise_any(a) == _normalise_any(b)
+
+
+def contains_words(text: str, part: str) -> bool:
+    """Does ``text`` contain the sentence ``part`` (ignoring case, marks and punctuation)?"""
+    inner = _normalise_any(part)
+    return bool(inner) and inner in _normalise_any(text)
+
+
+# Spoken digits. A caller's sentence with a number in it may carry a new phone number
+# or a new time, so it is read for slot values even after the outcome was announced.
+_DIGIT_WORDS = {
+    "en": "zero one two three four five six seven eight nine ten",
+    "he": "אפס אחת אחד שתיים שתים שניים שנים שלוש שלושה ארבע ארבעה חמש חמישה שש שישה שבע שבעה שמונה תשע תשעה עשר",
+    "ar": "صفر واحد وحده اتنين اثنين تنين تلاته ثلاثه تلات اربعه اربع خمسه خمس سته ست سبعه سبع تمانيه ثمانيه تمان تسعه تسع عشره",
+}
+_DIGIT_SETS = {language: frozenset(words.split()) for language, words in _DIGIT_WORDS.items()}
+_ONE_LETTER_PREFIXES = {"he": "בלומה", "ar": "بلو"}
+_WORD_SPLIT = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def mentions_digits(text: str, language: str = "en") -> bool:
+    """Is there a number in what the caller said - written as digits or spoken as digit words?"""
+    if any(ch.isdigit() for ch in text or ""):
+        return True
+    base = _base(language)
+    words = _DIGIT_SETS.get(base, _DIGIT_SETS["en"])
+    prefixes = _ONE_LETTER_PREFIXES.get(base, "")
+    norm = _normalise_any(text) if base in _BY_LANGUAGE else _normalise(text or "")
+    for word in _WORD_SPLIT.split(norm):
+        if word in words or (len(word) > 2 and word[0] in prefixes and word[1:] in words):
+            return True
+    return False

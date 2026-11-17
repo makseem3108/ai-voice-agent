@@ -181,7 +181,7 @@ def test_local_voice_pauses_the_bot_at_once_and_stt_confirms_the_barge_in() -> N
     assert "already paused" in (format_record(barge) or "")
 
 
-def test_unconfirmed_local_pause_resumes_where_it_stopped() -> None:
+def test_unconfirmed_local_pause_drops_a_short_rest_instead_of_resuming_mid_word() -> None:
     async def scenario() -> Rig:
         detector = FakeDetector()
         rig = Rig(FakeLLM(["Short answer."]), FakeTTS(frames_per_sentence=12), detector=detector, barge_confirm_s=0.1)
@@ -197,10 +197,10 @@ def test_unconfirmed_local_pause_resumes_where_it_stopped() -> None:
         return rig
 
     rig = run(scenario)
-    assert len(rig.frames) == 12  # the whole answer was played after all
+    assert 3 <= len(rig.frames) < 12  # under a second was left: not continued mid-word (see test_clean_resume.py)
     assert rig.agent.false_pauses == 1 and rig.agent.barge_ins == 0
     (resume,) = rig.of("barge_resume")
-    assert 80 <= resume["paused_ms"] <= 400
+    assert 80 <= resume["paused_ms"] <= 400 and resume["action"] == "dropped"
     assert rig.agent.history[-1]["content"] == "Short answer."  # the reply was not cancelled
     assert rig.llm.cancelled == 0
 
@@ -382,6 +382,17 @@ def test_recording_is_off_by_default_and_other_new_defaults(tmp_path: Path) -> N
     assert settings.end_silence_ms == 1500 and settings.end_silence_max_ms == 3000
     on = load_settings(tmp_path / "none.env", environ={"DEBUG_RECORD_AUDIO": "true", "BARGE_VAD_ENABLED": "false"})
     assert on.debug_record_audio is True and on.barge_vad_enabled is False
+
+
+def test_recording_can_be_limited_to_one_line(tmp_path: Path) -> None:
+    off = load_settings(tmp_path / "none.env", environ={"DEBUG_RECORD_PROFILES": "clinic_ar"})
+    assert not off.records_audio("clinic_ar")  # the main switch is still off
+    every = load_settings(tmp_path / "none.env", environ={"DEBUG_RECORD_AUDIO": "true"})
+    assert every.records_audio("clinic_ar") and every.records_audio("lead_qualification") and every.records_audio(None)
+    one = load_settings(tmp_path / "none.env", environ={"DEBUG_RECORD_AUDIO": "true", "DEBUG_RECORD_PROFILES": " clinic_ar , "})
+    assert one.debug_record_profiles == ("clinic_ar",)
+    assert one.records_audio("clinic_ar")
+    assert not one.records_audio("clinic_he") and not one.records_audio("lead_qualification") and not one.records_audio(None)
 
 
 def test_recordings_directory_is_git_ignored() -> None:

@@ -126,6 +126,17 @@ def test_late_utterance_end_for_earlier_speech_does_not_cut_the_next_turn() -> N
     assert kinds(t.feed(UtteranceEnd(last_word_end=12.4))) == [END_OF_TURN]
 
 
+def test_utterance_end_does_not_cut_a_sentence_that_is_still_arriving() -> None:
+    """Seen live: "مرحبا، وصلت لعيادة ..." - the backup signal for the pause after the first word
+    ended the turn at "مرحبا" while the rest of the sentence was already coming in."""
+    t = NovaTurnTracker()
+    t.feed(piece("مرحبا", final=True, start=6.0, duration=0.8, last=6.7))
+    t.feed(piece("وصلت لعياده", start=6.8, duration=1.5))  # still a guess: the caller is talking
+    assert t.feed(UtteranceEnd(last_word_end=6.7)) == [] and t.open
+    end = t.feed(piece("وصلت لعياده هاربر لطب الاسنان", final=True, speech_final=True, start=6.8, duration=4.5, last=11.2))[-1]
+    assert end.event == END_OF_TURN and end.transcript == "مرحبا وصلت لعياده هاربر لطب الاسنان"
+
+
 def test_timeout_is_our_own_last_resort_and_keeps_an_unfinalized_guess() -> None:
     t = NovaTurnTracker()
     t.feed(piece("אני רוצה לקבוע"))  # only ever a guess

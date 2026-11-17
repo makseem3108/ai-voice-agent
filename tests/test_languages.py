@@ -185,7 +185,7 @@ def test_arabic_profile_wiring_and_no_qaf_in_fixed_lines(tmp_path: Path) -> None
     profile = load_profile("clinic_ar", PROFILES_DIR)
     s = settings(tmp_path)
     check_providers(profile, s)
-    assert describe_stt(profile, s) == "nova-3/multi[ar,he]" and profile.tts.voice == "ar-JO-SanaNeural"
+    assert describe_stt(profile, s) == "nova-3/ar" and profile.tts.voice == "ar-JO-SanaNeural"  # Arabic only since the first real call
     spoken_as_is = fixed_phrases(profile) + [slot.question for slot in profile.slots if slot.question]
     assert [text for text in spoken_as_is if "ق" in text] == []
 
@@ -197,7 +197,8 @@ def test_fixed_phrases_are_in_the_profile_language() -> None:
     assert incomplete_closing(hebrew) == "תודה שהתקשרתם למרפאת השיניים הרבור. להתראות!" and incomplete_closing(hebrew) in phrases
     assert goodbye_text(hebrew) in phrases and "מרפאת השיניים הרבור" in goodbye_text(hebrew)
     assert anything_else_question(hebrew) == HEBREW.anything_else
-    assert APOLOGY_TEXT not in phrases and len(set(phrases)) == len(phrases) == 8
+    assert HEBREW.didnt_catch in phrases and any("יחזור אליכם בטלפון" in p for p in phrases)
+    assert APOLOGY_TEXT not in phrases and len(set(phrases)) == len(phrases) == 12  # 10 + the no-phone-number closing + the short "say the number again"
     assert closing_text(hebrew, "incomplete") == incomplete_closing(hebrew)
 
 

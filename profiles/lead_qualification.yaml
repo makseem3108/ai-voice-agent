@@ -46,6 +46,7 @@ outcomes:
       noted and that they are welcome to call us again whenever it suits them.
       Do not promise that anyone will call or contact them.
     closing: Thanks, I've noted your details, and we won't call you. You're welcome to call us again any time. Have a great day!
+    confirmation: Thank you[, {name}]. I've noted your details, and that you'd rather not get a call.
 
 knowledge: |
   Northwind Solar installs rooftop solar panels and home batteries for houses.
@@ -57,6 +58,8 @@ knowledge: |
   Panels come with a 25 year performance warranty.
   Renters can ask their landlord to contact us; the owner of the house has to request the installation.
 tone: warm, upbeat and efficient
+# Said by the code once everything is collected (fixed sentence, see clinic.yaml).
+confirmation: Thank you[, {name}]. I've noted your details for one of our advisors.
 # Said when the caller is a fit and all slots are filled.
 closing_qualified: Thanks, that's everything I need. An advisor will call you back soon. Have a great day!
 # Said when we cannot help (for example a rented home or an apartment). No promises here.

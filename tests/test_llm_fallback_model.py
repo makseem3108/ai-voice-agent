@@ -105,7 +105,38 @@ def test_main_model_replies_carry_no_model_tag() -> None:
     assert "model" not in result
 
 
-def test_per_minute_limit_does_not_switch_models() -> None:
+def test_per_minute_limit_waits_briefly_and_retries_instead_of_apologising() -> None:
+    """Call 2 of Step 5: "Please try again in 2.9025s" was answered with an apology to the caller."""
+    models: list[str] = []
+    soon = TPM.replace("Please try again in 10.7s.", "Please try again in 0.05s.")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        models.append(json.loads(request.content)["model"])
+        return limited(soon) if len(models) == 1 else ok("After a short wait.")
+
+    client = llm(handler)
+    result, usage = ask(client)
+    assert result["say"] == "After a short wait." and "model" not in result  # same model, second try
+    assert models == [BIG, BIG] and usage.requests == 2 and client.minute_limit_waits == 1 and client.model_fallbacks == 0
+
+
+def test_per_minute_limit_with_a_long_wait_uses_the_other_model_for_that_request() -> None:
+    models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        models.append(model)
+        return limited(TPM) if model == BIG else ok("From the small model.")  # 10.7 s: too long to wait in a call
+
+    client = llm(handler)
+    result, _ = ask(client)
+    assert models == [BIG, SMALL] and result["model"] == SMALL
+    assert client.ledger.blocked(BIG) is False  # only the daily limit parks the main model
+    ask(client)
+    assert models[-2:] == [BIG, SMALL]  # the next request tries the main model again
+
+
+def test_per_minute_limit_everywhere_is_still_an_error() -> None:
     models: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -114,7 +145,9 @@ def test_per_minute_limit_does_not_switch_models() -> None:
 
     with pytest.raises(LLMError, match="tokens per minute"):
         ask(llm(handler))
-    assert models == [BIG]
+    assert models == [BIG, SMALL]
+    with pytest.raises(LLMError, match="tokens per minute"):
+        ask(llm(lambda r: limited(TPM), fallback=None))
 
 
 def test_no_fallback_configured_or_fallback_also_refused_is_an_error() -> None:
@@ -176,7 +209,8 @@ def test_every_answered_request_is_added_under_the_model_that_answered() -> None
         return limited(TPD) if json.loads(request.content)["model"] == BIG else ok(tokens=1450)
 
     ask(llm(handler, ledger=ledger))
-    assert ledger.last_24h() == {SMALL: {"tokens": 1450, "requests": 1}}  # the refused request used nothing
+    # the refused request used nothing - but Groq's message said how much of the day is gone
+    assert ledger.last_24h() == {SMALL: {"tokens": 1450, "requests": 1}, BIG: {"tokens": 199211, "requests": 0}}
 
 
 def test_summary_text_for_the_call_log() -> None:
@@ -218,7 +252,7 @@ def test_call_logs_the_fallback_model_once() -> None:
 
     rig = run(scenario)
     (record,) = rig.of("llm_fallback_model")  # once per call, not once per turn
-    assert record == {"type": "llm_fallback_model", "turn": 1, "model": SMALL}
+    assert record == {"type": "llm_fallback_model", "turn": 1, "model": SMALL, "reason": "daily"}
     assert rig.agent.summary()["llm_fallback_model"] == SMALL and rig.agent.slots["owns_home"] == "yes"
     line = format_record(record)
     assert line == f"[llm_fallback_model] the main model's daily token limit is used up; this call is answered by {SMALL}"

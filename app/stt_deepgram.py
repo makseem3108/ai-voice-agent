@@ -93,6 +93,8 @@ class Transcript:
     duration: float
     confidence: float = 0.0
     last_word_end: Optional[float] = None  # audio time the last word ended
+    #: Languages Deepgram detected in this slice (only sent with language=multi).
+    languages: tuple[str, ...] = ()
 
     @property
     def end(self) -> float:
@@ -152,6 +154,7 @@ def parse_message(raw: Union[str, bytes]) -> SttEvent:
             duration=_num(msg.get("duration")),
             confidence=_num(best.get("confidence")),
             last_word_end=last_end,
+            languages=tuple(str(x) for x in (best.get("languages") or []) if isinstance(x, str)),
         )
     if kind == "SpeechStarted":
         return SpeechStarted(timestamp=_num(msg.get("timestamp")))
